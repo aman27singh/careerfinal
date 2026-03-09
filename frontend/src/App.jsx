@@ -835,7 +835,7 @@ const ProfileScan = ({ result, loading }) => {
                   color: 'var(--accent-secondary)',
                   numeric: false,
                 },
-                { label: 'Skills',         value: result.skill_ratings?.length || result.technical_skills?.length || 0, color: 'var(--accent-primary)',  numeric: true },
+                { label: 'Skills',         value: (result.skill_ratings?.length || result.technical_skills?.length || 0), color: 'var(--accent-primary)',  numeric: true },
                 { label: 'Projects',       value: result.projects?.length || 0,                                         color: 'var(--accent-orange)',   numeric: true },
                 { label: 'GitHub Repos',   value: result.github_analysis?.repo_count || 0,                              color: 'var(--accent-primary)',  numeric: true },
                 { label: 'Certifications', value: result.certifications?.length || 0,                                   color: '#8B5CF6',                numeric: true },
@@ -1011,6 +1011,24 @@ const ProfileScan = ({ result, loading }) => {
               <div className="skills-cloud">
                 {result.soft_skills.map((skill, i) => (
                   <span key={i} className="skill-tag soft">{skill}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Learned from Quests ── */}
+          {result.quest_skills?.length > 0 && (
+            <div className="result-card" style={{ borderLeft: '3px solid #22C55E' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.75rem' }}>
+                <h3 style={{ margin: 0, color: '#22C55E' }}>Learned from Quests</h3>
+                <span style={{ fontSize: '0.72rem', background: 'rgba(34,197,94,0.12)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '999px', padding: '0.15rem 0.55rem', fontWeight: 700 }}>
+                  +{result.quest_skills.length} new
+                </span>
+              </div>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.75rem' }}>These skills were verified through completed quests and have been added to your profile.</p>
+              <div className="skills-cloud">
+                {result.quest_skills.map((skill, i) => (
+                  <span key={i} className="skill-tag" style={{ background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.35)', color: '#22C55E' }}>{skill}</span>
                 ))}
               </div>
             </div>

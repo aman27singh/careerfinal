@@ -342,12 +342,26 @@ def analyze_profile_endpoint(
 
 @app.get("/profile-scan/{user_id}")
 def get_profile_scan(user_id: str):
-    """Return the last saved profile scan result for a user."""
+    """Return the last saved profile scan result, enriched with quest-learned skills."""
     user = user_store.get_user(user_id) or {}
     scan = user.get("scan_result")
     if not scan:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="No scan result found")
+
+    # Merge learned_skills (from quests) into technical_skills so they appear
+    # in the Profile Analysis view.
+    learned: list[str] = user.get("learned_skills") or []
+    if isinstance(learned, set):
+        learned = sorted(learned)
+    existing_tech: list[str] = scan.get("technical_skills") or []
+    existing_lower = {s.lower() for s in existing_tech}
+    # Only add skills not already present (case-insensitive)
+    new_from_quests = [s for s in learned if s.lower() not in existing_lower]
+    # Return a shallow copy so we don't mutate the stored scan_result
+    scan = dict(scan)
+    scan["technical_skills"] = existing_tech + new_from_quests
+    scan["quest_skills"] = new_from_quests   # front-end uses this to render them distinctly
     return scan
 
 
