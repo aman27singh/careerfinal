@@ -91,65 +91,98 @@ _ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
 # ── RapidAPI / JSearch credentials (optional) ─────────────────────────────────
 # JSearch aggregates Indeed, LinkedIn Jobs, and Glassdoor.
 # Free tier: 200 req/month — https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
-_RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+# NOTE: loaded dynamically at call time so Lambda env-var updates take effect
+# without requiring a cold start.
+def _get_rapidapi_key() -> str:
+    return os.getenv("RAPIDAPI_KEY", "")
 
 # ── Role detection keywords ────────────────────────────────────────────────────
 # Maps job title keywords → canonical role name (must match market_skills.json keys)
 _ROLE_PATTERNS: list[tuple[list[str], str]] = [
-    (["frontend", "front-end", "ui developer", "react developer"],          "Frontend Developer"),
-    (["backend", "back-end", "server-side", "api developer"],               "Backend Developer"),
-    (["fullstack", "full-stack", "full stack"],                              "Full Stack Developer"),
-    (["data scientist", "ml engineer", "machine learning", "ai engineer"],   "Data Scientist"),
-    (["data analyst", "analytics engineer", "bi developer"],                 "Data Analyst"),
-    (["devops", "sre", "site reliability", "platform engineer", "infra"],    "DevOps Engineer"),
-    (["cloud engineer", "aws engineer", "azure engineer", "solutions arch"], "Cloud Engineer"),
-    (["android", "ios engineer", "mobile developer", "flutter"],             "Mobile Developer"),
+    (["frontend", "front-end", "front end", "ui developer", "ui engineer",
+      "react developer", "react engineer", "angular developer", "vue developer",
+      "web developer", "web engineer", "javascript developer", "javascript engineer",
+      "typescript developer", "typescript engineer", "ui/ux developer"],       "Frontend Developer"),
+    (["backend", "back-end", "back end", "server-side", "api developer",
+      "api engineer", "python developer", "python engineer", "java developer",
+      "java engineer", "golang", "go developer", "ruby developer", "rails developer",
+      "php developer", "node developer", "node engineer", "django", "flask",
+      "spring boot", "rest api", "microservices engineer"],                    "Backend Developer"),
+    (["fullstack", "full-stack", "full stack", "software engineer",
+      "software developer", "application developer", "application engineer",
+      "generalist engineer", "web application developer"],                     "Full Stack Developer"),
+    (["data scientist", "ml engineer", "machine learning", "ai engineer",
+      "artificial intelligence", "deep learning", "nlp engineer", "llm engineer",
+      "research engineer", "computer vision", "model engineer", "ai developer"],  "Data Scientist"),
+    (["data analyst", "analytics engineer", "bi developer",
+      "business intelligence", "business analyst", "data engineer",
+      "etl developer", "reporting analyst", "insights analyst"],               "Data Analyst"),
+    (["devops", "sre", "site reliability", "platform engineer",
+      "infrastructure engineer", "infra engineer", "release engineer",
+      "build engineer", "cloud operations", "devsecops",
+      "systems engineer", "systems administrator"],                            "DevOps Engineer"),
+    (["cloud engineer", "aws engineer", "azure engineer", "gcp engineer",
+      "solutions architect", "solutions arch", "cloud architect",
+      "cloud developer", "cloud consultant", "infrastructure architect"],      "Cloud Engineer"),
+    (["android developer", "android engineer", "ios developer",
+      "ios engineer", "mobile developer", "mobile engineer",
+      "flutter developer", "react native developer", "swift developer",
+      "kotlin developer", "cross-platform developer"],                         "Mobile Developer"),
 ]
 
 # ── Skill extraction — tags/keywords we recognise ─────────────────────────────
 _KNOWN_SKILLS: set[str] = {
     "python", "java", "javascript", "typescript", "c++", "c#", "go", "rust",
-    "ruby", "php", "swift", "kotlin", "scala",
-    "react", "angular", "vue", "node", "django", "flask", "fastapi", "spring",
-    "express", "rails", "laravel",
+    "ruby", "php", "swift", "kotlin", "scala", "dart",
+    "react", "angular", "vue", "next.js", "nuxt", "svelte", "node", "django",
+    "flask", "fastapi", "spring", "express", "rails", "laravel", "nestjs",
     "sql", "postgresql", "mysql", "mongodb", "redis", "elasticsearch",
+    "dynamodb", "cassandra", "bigquery", "snowflake",
     "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "ansible",
-    "linux", "git", "ci/cd", "jenkins", "github actions",
-    "machine learning", "tensorflow", "pytorch", "pandas", "numpy",
-    "spark", "hadoop", "kafka", "airflow",
-    "rest", "api", "graphql", "microservices",
-    "excel", "tableau", "power bi",
+    "linux", "git", "ci/cd", "jenkins", "github actions", "gitlab ci",
+    "machine learning", "tensorflow", "pytorch", "scikit-learn", "pandas",
+    "numpy", "spark", "hadoop", "kafka", "airflow", "dbt", "looker",
+    "rest", "api", "graphql", "microservices", "grpc",
+    "excel", "tableau", "power bi", "llm", "openai", "langchain",
+    "react native", "flutter", "figma", "storybook",
 }
 
 # Tag normalisation: RemoteOK / Adzuna tags → canonical skill names
 _TAG_MAP: dict[str, str] = {
-    "js":                "javascript",
-    "ts":                "javascript",
-    "typescript":        "javascript",
-    "nodejs":            "node",
-    "node.js":           "node",
-    "reactjs":           "react",
-    "vuejs":             "vue",
-    "postgres":          "sql",
-    "postgresql":        "sql",
-    "mysql":             "sql",
-    "nosql":             "mongodb",
-    "k8s":               "kubernetes",
-    "github-actions":    "ci/cd",
-    "jenkins":           "ci/cd",
-    "devops":            "docker",
-    "ml":                "machine learning",
-    "deep learning":     "machine learning",
-    "ai":                "machine learning",
-    "data science":      "machine learning",
-    "llm":               "machine learning",
-    "gcp":               "aws",   # count cloud skills together for simplicity
-    "azure":             "aws",
+    "js":                  "javascript",
+    "ts":                  "typescript",
+    "nodejs":              "node",
+    "node.js":             "node",
+    "reactjs":             "react",
+    "react.js":            "react",
+    "next":                "next.js",
+    "nextjs":              "next.js",
+    "vuejs":               "vue",
+    "vue.js":              "vue",
+    "nestjs":              "nestjs",
+    "postgres":            "postgresql",
+    "nosql":               "mongodb",
+    "k8s":                 "kubernetes",
+    "github-actions":      "ci/cd",
+    "github actions":      "ci/cd",
+    "gitlab-ci":           "ci/cd",
+    "jenkins":             "ci/cd",
+    "ml":                  "machine learning",
+    "deep learning":       "machine learning",
+    "ai":                  "machine learning",
+    "data science":        "machine learning",
+    "openai api":          "openai",
     "amazon web services": "aws",
-    "fast api":          "fastapi",
-    "power bi":          "power bi",
-    "powerbi":           "power bi",
-    "tableau":           "tableau",
+    "fast api":            "fastapi",
+    "powerbi":             "power bi",
+    "react-native":        "react native",
+    "golang":              "go",
+    "c sharp":             "c#",
+    "dotnet":              "c#",
+    ".net":                "c#",
+    "scikit":              "scikit-learn",
+    "sklearn":             "scikit-learn",
+    "postgre":             "postgresql",
 }
 
 
@@ -225,14 +258,15 @@ _JSEARCH_QUERIES: list[tuple[str, str]] = [
 ]
 
 
-def _fetch_jsearch_role(query: str, num_pages: int = 1) -> list[dict]:
+def _fetch_jsearch_role(query: str, num_pages: int = 3) -> list[dict]:
     """Fetch jobs from JSearch (RapidAPI) — aggregates Indeed, LinkedIn, Glassdoor."""
-    if not _RAPIDAPI_KEY:
+    key = _get_rapidapi_key()
+    if not key:
         return []
     url = "https://jsearch.p.rapidapi.com/search"
     headers = {
         "x-rapidapi-host": "jsearch.p.rapidapi.com",
-        "x-rapidapi-key":  _RAPIDAPI_KEY,
+        "x-rapidapi-key":  key,
     }
     params = {
         "query":      query,
@@ -404,10 +438,10 @@ def refresh_market_data(write: bool = True) -> dict:
 
     # Source 2: JSearch / RapidAPI (Indeed + LinkedIn + Glassdoor) — parallel
     jsearch_total = 0
-    if _RAPIDAPI_KEY:
+    if _get_rapidapi_key():
         def _jsearch_fetch(query_role):
             query, role = query_role
-            jobs = _fetch_jsearch_role(query, num_pages=1)
+            jobs = _fetch_jsearch_role(query, num_pages=3)
             return _parse_jsearch_jobs(jobs, role)
 
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -421,7 +455,7 @@ def refresh_market_data(write: bool = True) -> dict:
                     logger.warning("JSearch worker failed: %s", exc)
         logger.info("JSearch: %d relevant job pairs extracted", jsearch_total)
     else:
-        logger.info("JSearch skipped — RAPIDAPI_KEY not set")
+        logger.info("JSearch skipped — RAPIDAPI_KEY not set or empty")
 
     # Source 3: Adzuna — parallel across roles
     adzuna_total = 0
