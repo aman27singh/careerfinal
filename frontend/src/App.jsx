@@ -77,6 +77,7 @@ function App() {
   const [agentLog, setAgentLog] = useState([])  // history of last N agent runs
   const [agentStep, setAgentStep] = useState(null)  // current step: OBSERVE|REASON|PLAN|ACT|REFLECT
   const [questMapKey, setQuestMapKey] = useState(0) // bump to force QuestMap re-mount (auto-advance)
+  const [autoGenNext, setAutoGenNext] = useState(false)
 
   // Helper: update gapResult + persist to localStorage
   const updateGapResult = (data) => {
@@ -299,6 +300,7 @@ function App() {
             masteryData={masteryData}
             userId="user_1"
             fetchMetrics={fetchMetrics}
+            autoGenerateNext={autoGenNext}
             onRoadmapComplete={(newSkills) => {
               if (!newSkills?.length) return
               const updated = [...new Set([...userAddedSkills, ...newSkills])]
@@ -330,7 +332,10 @@ function App() {
                       if (newGap.missing_skills?.length > 0) {
                         updateGapResult(newGap)
                         // Force QuestMap remount so it auto-generates a new roadmap
+                        setAutoGenNext(true)
                         setQuestMapKey(prev => prev + 1)
+                        // Reset after remount latches it
+                        setTimeout(() => setAutoGenNext(false), 8000)
                       }
                     }
                   } catch (e) { console.error('Auto-advance role-gap failed', e) }
@@ -1861,7 +1866,7 @@ const RESOURCE_META = {
   course:   { icon: '🎓', label: 'Course',   color: '#8B5CF6', bg: 'rgba(139,92,246,0.08)' },
 }
 
-const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fetchMetrics, onRoadmapComplete }) => {
+const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fetchMetrics, onRoadmapComplete, autoGenerateNext }) => {
   const [loading, setLoading] = useState(false)
   const [roadmap, setRoadmap] = useState(null)
   const [error, setError] = useState(null)
@@ -1878,6 +1883,7 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
 
   const _uid = userId || 'user_1'
   const autoGenTriggered = useRef(false) // prevent re-triggering auto-generate
+  const handleGenerateRef = useRef(null)  // stable ref so persist-load effect can call it
 
   // Load persisted roadmap on mount
   useEffect(() => {
@@ -1922,8 +1928,13 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
           r.phases.forEach((p, i) => { if (p.completed) done[i] = true })
           setCompletedPhases(done)
           // Check if already fully completed
-          if (r.phases.length > 0 && r.phases.every(p => p.completed)) {
+          const allDone = r.phases.length > 0 && r.phases.every(p => p.completed)
+          if (allDone) {
             setRoadmapCompleted(true)
+            // Auto-generate next roadmap when prop says so (triggered by completion handler in App)
+            if (autoGenerateNext) {
+              setTimeout(() => { handleGenerateRef.current?.() }, 1500)
+            }
           }
         }
       })
@@ -1992,6 +2003,8 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
       setLoading(false)
     }
   }
+  // Keep ref in sync with latest handleGenerate so the persist-load effect can call it
+  handleGenerateRef.current = handleGenerate
 
   // Auto-generate roadmap when gapResult arrives and we have no existing roadmap
   // (e.g. right after onboarding completes)
@@ -2123,7 +2136,9 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
           </div>
           <p style={{ margin: '0 0 0.85rem', fontSize: '0.9rem', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
             You've submitted every phase project. Your XP, level, and skill profile have been updated.
-            <br /><strong style={{ color: 'var(--accent-primary)' }}>Auto-advancing to your next skill challenge in a moment…</strong>
+            <br /><strong style={{ color: 'var(--accent-primary)' }}>
+              {autoGenerateNext ? '🔄 Generating your next roadmap for advanced skills…' : 'Auto-advancing to your next skill challenge in a moment…'}
+            </strong>
           </p>
           {completionData?.skills?.length > 0 && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.45rem' }}>
