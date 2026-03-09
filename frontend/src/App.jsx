@@ -302,16 +302,16 @@ function App() {
             fetchMetrics={fetchMetrics}
             autoGenerateNext={autoGenNext}
             onRoadmapComplete={(newSkills) => {
-              if (!newSkills?.length) return
-              const updated = [...new Set([...userAddedSkills, ...newSkills])]
-              setUserAddedSkills(updated)
-              localStorage.setItem('careeros_added_skills', JSON.stringify(updated))
+              const updated = [...new Set([...userAddedSkills, ...(newSkills || [])])]
+              if (newSkills?.length) {
+                setUserAddedSkills(updated)
+                localStorage.setItem('careeros_added_skills', JSON.stringify(updated))
+              }
               // Re-fetch metrics so dashboard + stats reflect new XP/level
               fetchMetrics()
 
               // ── Agentic auto-advance: re-analyze gap → generate next roadmap ──
               if (selectedRole) {
-                // Build updated skill list including newly learned skills
                 const latestSkills = [...new Set([
                   ...(scanResult?.technical_skills || []),
                   ...(scanResult?.github_analysis?.primary_languages || []),
@@ -328,15 +328,10 @@ function App() {
                     })
                     if (resp.ok) {
                       const newGap = await resp.json()
-                      // Only auto-advance if there are still missing skills to learn
-                      if (newGap.missing_skills?.length > 0) {
-                        updateGapResult(newGap)
-                        // Force QuestMap remount so it auto-generates a new roadmap
-                        setAutoGenNext(true)
-                        setQuestMapKey(prev => prev + 1)
-                        // Reset after remount latches it
-                        setTimeout(() => setAutoGenNext(false), 8000)
-                      }
+                      const hasMoreToLearn = newGap.missing_skills?.length > 0
+                      updateGapResult(newGap)
+                      setAutoGenNext(hasMoreToLearn)
+                      setQuestMapKey(prev => prev + 1)
                     }
                   } catch (e) { console.error('Auto-advance role-gap failed', e) }
                 }, 3000)
@@ -1929,13 +1924,7 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
           setCompletedPhases(done)
           // Check if already fully completed
           const allDone = r.phases.length > 0 && r.phases.every(p => p.completed)
-          if (allDone) {
-            setRoadmapCompleted(true)
-            // Auto-generate next roadmap when prop says so (triggered by completion handler in App)
-            if (autoGenerateNext) {
-              setTimeout(() => { handleGenerateRef.current?.() }, 1500)
-            }
-          }
+          if (allDone) setRoadmapCompleted(true)
         }
       })
       .catch(() => {})
@@ -2005,6 +1994,17 @@ const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fe
   }
   // Keep ref in sync with latest handleGenerate so the persist-load effect can call it
   handleGenerateRef.current = handleGenerate
+
+  // When autoGenerateNext becomes true on remount (new gap analyzed), kick off generation
+  // Use a ref to prevent double-firing across re-renders
+  const autoGenFired = useRef(false)
+  useEffect(() => {
+    if (!autoGenerateNext || autoGenFired.current) return
+    autoGenFired.current = true
+    // Short delay so the component is fully settled before generating
+    const t = setTimeout(() => { handleGenerateRef.current?.() }, 800)
+    return () => clearTimeout(t)
+  }, [autoGenerateNext]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-generate roadmap when gapResult arrives and we have no existing roadmap
   // (e.g. right after onboarding completes)
