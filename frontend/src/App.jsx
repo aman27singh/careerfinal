@@ -263,7 +263,7 @@ function App() {
 
         {activeTab === 'dashboard' && <Dashboard metrics={metrics} setActiveTab={setActiveTab} userName={userName} onSetName={handleSetName} masteryData={masteryData} marketStats={marketStats} />}
         {activeTab === 'profile-scan' && (
-          <ProfileScan result={scanResult} setResult={setScanResult} loading={scanLoading} />
+          <ProfileScan result={scanResult} setResult={setScanResult} loading={scanLoading} metrics={metrics} />
         )}
         {activeTab === 'role-gap' && (
           <RoleGap
@@ -779,7 +779,7 @@ const Dashboard = ({ metrics, setActiveTab, userName, onSetName, masteryData, ma
   )
 }
 
-const ProfileScan = ({ result, loading }) => {
+const ProfileScan = ({ result, loading, metrics }) => {
   // Colors for the chart matching your theme
   const COLORS = ['#00F0FF', '#22C55E', '#F59E0B', '#8B5CF6', '#EC4899']
 
@@ -856,11 +856,11 @@ const ProfileScan = ({ result, loading }) => {
           </div>
 
           {/* ── Skill Ratings ── */}
-          {result.skill_ratings?.length > 0 && (
+          {(result.skill_ratings?.length > 0 || result.quest_skills?.length > 0) && (
             <div className="result-card">
               <h3>Skill Ratings</h3>
               {(['Expert','Advanced','Intermediate','Beginner']).map(level => {
-                const skills = result.skill_ratings.filter(s => s.level === level)
+                const skills = (result.skill_ratings || []).filter(s => s.level === level)
                 if (!skills.length) return null
                 const levelColor = level === 'Expert' ? '#F59E0B' : level === 'Advanced' ? '#22C55E' : level === 'Intermediate' ? '#00F0FF' : '#8B5CF6'
                 return (
@@ -885,6 +885,41 @@ const ProfileScan = ({ result, loading }) => {
                   </div>
                 )
               })}
+
+              {/* ── Quest-learned skills tier ── */}
+              {result.quest_skills?.length > 0 && (() => {
+                const skillXp = metrics?.skill_distribution || {}
+                const maxXp = Math.max(...Object.values(skillXp), 1)
+                return (
+                  <div style={{ marginBottom: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.75rem' }}>
+                      <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#22C55E', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                        Learned via Quests — {result.quest_skills.length} skill{result.quest_skills.length > 1 ? 's' : ''}
+                      </div>
+                      <span style={{ fontSize: '0.65rem', background: 'rgba(34,197,94,0.12)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.3)', borderRadius: '999px', padding: '0.1rem 0.45rem', fontWeight: 700 }}>Quest XP</span>
+                    </div>
+                    {result.quest_skills.map((skill, i) => {
+                      const xpVal = skillXp[skill] || skillXp[skill?.toLowerCase()] || 0
+                      const score = xpVal > 0 ? Math.min(100, Math.round((xpVal / maxXp) * 100)) : 30
+                      return (
+                        <div key={i} style={{ marginBottom: '0.75rem' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                              <span style={{ fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-primary)' }}>{skill}</span>
+                              <span style={{ fontSize: '0.62rem', background: 'rgba(34,197,94,0.1)', color: '#22C55E', border: '1px solid rgba(34,197,94,0.25)', borderRadius: '999px', padding: '0.08rem 0.4rem', fontWeight: 700 }}>🎮 Quest</span>
+                            </div>
+                            <span style={{ fontSize: '0.8rem', fontWeight: 700, color: '#22C55E' }}>{score}/100</span>
+                          </div>
+                          <div style={{ height: '6px', borderRadius: '999px', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
+                            <div style={{ height: '100%', width: `${score}%`, background: 'linear-gradient(90deg, #22C55E, #00F0FF)', borderRadius: '999px', transition: 'width 0.6s ease' }} />
+                          </div>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.25rem', fontStyle: 'italic' }}>Earned through quest completion{xpVal > 0 ? ` · ${xpVal} XP` : ''}</div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              })()}
             </div>
           )}
 
