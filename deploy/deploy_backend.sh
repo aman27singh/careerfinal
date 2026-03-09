@@ -21,6 +21,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# Load local .env if present (contains API keys like RAPIDAPI_KEY)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../.env" ]]; then
+  set -o allexport
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/../.env"
+  set +o allexport
+fi
+
 REGION="${AWS_REGION:-us-east-1}"
 LAMBDA_NAME="${LAMBDA_FUNCTION_NAME:-careeros-api}"
 PYTHON_CMD="${PYTHON_CMD:-.venv/bin/python}"

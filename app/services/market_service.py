@@ -244,6 +244,51 @@ def _parse_remoteok_jobs(jobs: list[dict]) -> list[tuple[str, list[str]]]:
     return parsed
 
 
+# ── Data source: Arbeitnow (free, no auth, 200+ remote tech jobs) ──────────────
+
+def _fetch_arbeitnow() -> list[dict]:
+    """Fetch remote tech jobs from Arbeitnow (free, no auth required)."""
+    all_jobs: list[dict] = []
+    for page in range(1, 5):  # fetch up to 4 pages × 100 = 400 jobs
+        try:
+            resp = requests.get(
+                "https://arbeitnow.com/api/job-board-api",
+                params={"page": page},
+                headers={"User-Agent": "CareerCoach-MarketBot/1.0"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json().get("data", [])
+            if not data:
+                break
+            all_jobs.extend(data)
+        except Exception as exc:
+            logger.warning("Arbeitnow page %d failed: %s", page, exc)
+            break
+    logger.info("Arbeitnow: fetched %d jobs", len(all_jobs))
+    return all_jobs
+
+
+def _parse_arbeitnow_jobs(jobs: list[dict]) -> list[tuple[str, list[str]]]:
+    """Extract (role, [skills]) pairs from Arbeitnow job objects."""
+    parsed: list[tuple[str, list[str]]] = []
+    for job in jobs:
+        title = job.get("title", "") or ""
+        role = _detect_role(title)
+        if not role:
+            continue
+        # Arbeitnow provides a 'tags' list and a 'description' field
+        tags: list[str] = job.get("tags") or []
+        skills = [s for t in tags if (s := _normalise_tag(t)) is not None]
+        if not skills:
+            desc = (job.get("description") or "").lower()
+            skills = [sk for sk in _KNOWN_SKILLS if sk in desc]
+        if skills:
+            parsed.append((role, skills))
+    return parsed
+
+
 # ── Data source: JSearch via RapidAPI (Indeed + LinkedIn + Glassdoor) ─────────
 
 _JSEARCH_QUERIES: list[tuple[str, str]] = [
@@ -436,7 +481,13 @@ def refresh_market_data(write: bool = True) -> dict:
     all_pairs.extend(remoteok_pairs)
     logger.info("RemoteOK: %d relevant job pairs extracted", len(remoteok_pairs))
 
-    # Source 2: JSearch / RapidAPI (Indeed + LinkedIn + Glassdoor) — parallel
+    # Source 2: Arbeitnow (free, no auth)
+    arbeitnow_jobs = _fetch_arbeitnow()
+    arbeitnow_pairs = _parse_arbeitnow_jobs(arbeitnow_jobs)
+    all_pairs.extend(arbeitnow_pairs)
+    logger.info("Arbeitnow: %d relevant job pairs extracted", len(arbeitnow_pairs))
+
+    # Source 3: JSearch / RapidAPI (Indeed + LinkedIn + Glassdoor) — parallel
     jsearch_total = 0
     if _get_rapidapi_key():
         def _jsearch_fetch(query_role):
@@ -457,7 +508,7 @@ def refresh_market_data(write: bool = True) -> dict:
     else:
         logger.info("JSearch skipped — RAPIDAPI_KEY not set or empty")
 
-    # Source 3: Adzuna — parallel across roles
+    # Source 4: Adzuna — parallel across roles
     adzuna_total = 0
     if _ADZUNA_APP_ID:
         adzuna_queries = [
@@ -513,9 +564,10 @@ def refresh_market_data(write: bool = True) -> dict:
         "roles_updated":        len(merged),
         "total_jobs_processed": len(all_pairs),
         "sources": {
-            "remoteok": len(remoteok_pairs),
-            "jsearch":  jsearch_total,
-            "adzuna":   adzuna_total,
+            "remoteok":   len(remoteok_pairs),
+            "arbeitnow":  len(arbeitnow_pairs),
+            "jsearch":    jsearch_total,
+            "adzuna":     adzuna_total,
         },
         "elapsed_s": elapsed,
         "written":   write,
