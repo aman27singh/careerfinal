@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import './App.css'
-import { analyzeProfile, generateCareerPlan, evaluateTask, generateChallenge, getSkillImpact, refreshMarketData, getLearningResources, getUserMastery, runAgentLoop } from './api/careerCoachApi'
+import { analyzeProfile, generateCareerPlan, evaluateTask, generateChallenge, getDailyChallenge, evaluateDailyChallenge, getSkillImpact, refreshMarketData, getLearningResources, getUserMastery, runAgentLoop, getProfileScan, getPersistedRoleGap, generateDynamicRoadmap, getPersistedRoadmap, submitPhaseProject, syncSkills } from './api/careerCoachApi'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
 import {
@@ -53,10 +53,13 @@ const _getOb = () => { try { return JSON.parse(localStorage.getItem('careeros_on
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
   const [scanResult, setScanResult] = useState(null)
+  const [scanLoading, setScanLoading] = useState(false)
   const [userAddedSkills, setUserAddedSkills] = useState(() => {
     try { return JSON.parse(localStorage.getItem('careeros_added_skills') || '[]') } catch { return [] }
   })
-  const [gapResult, setGapResult] = useState(null)
+  const [gapResult, setGapResult] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('careeros_gap_result')) } catch { return null }
+  })
   const [metrics, setMetrics] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -73,6 +76,17 @@ function App() {
   const [agentRunning, setAgentRunning] = useState(false)
   const [agentLog, setAgentLog] = useState([])  // history of last N agent runs
   const [agentStep, setAgentStep] = useState(null)  // current step: OBSERVE|REASON|PLAN|ACT|REFLECT
+  const [questMapKey, setQuestMapKey] = useState(0) // bump to force QuestMap re-mount (auto-advance)
+
+  // Helper: update gapResult + persist to localStorage
+  const updateGapResult = (data) => {
+    setGapResult(data)
+    if (data) {
+      try { localStorage.setItem('careeros_gap_result', JSON.stringify(data)) } catch {}
+    } else {
+      localStorage.removeItem('careeros_gap_result')
+    }
+  }
 
   const handleOnboardingComplete = async (data) => {
     // Strip the File object before persisting (not serialisable)
@@ -82,18 +96,46 @@ function App() {
     setOnboardingData(persistable)
     setUserName(data.name)
     if (data.targetRole) setSelectedRole(data.targetRole)
-    // After onboarding, take the student straight to Profile Scan
-    // so they immediately understand what to do next
-    setActiveTab('profile-scan')
-    // Run profile scan in background if resume or github was provided
+
+    // Kick off profile scan in background
+    let profileSkills = []
     if (resumeFile || data.githubUsername) {
+      setScanLoading(true)
       try {
         const fd = new FormData()
         if (resumeFile) fd.append('resume', resumeFile)
         if (data.githubUsername) fd.append('github_username', data.githubUsername)
+        fd.append('user_id', 'user_1')
         const result = await analyzeProfile(fd)
         setScanResult(result)
-      } catch (e) { console.error('Onboarding scan failed', e) }
+        profileSkills = [
+          ...(result?.technical_skills || []),
+          ...(result?.github_analysis?.primary_languages || []),
+        ]
+      } catch (e) { console.error('Onboarding scan failed', e) } finally {
+        setScanLoading(false)
+      }
+    }
+
+    // Auto-run Role Gap Analysis if a target role was selected
+    if (data.targetRole) {
+      setActiveTab('role-gap')
+      const allSkills = [...new Set([...profileSkills, ...userAddedSkills])]
+      try {
+        const response = await fetch(`${BASE_URL}/analyze-role`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_skills: allSkills, selected_role: data.targetRole, user_id: 'user_1' }),
+        })
+        if (response.ok) {
+          const gapData = await response.json()
+          updateGapResult(gapData)
+          // Navigate to Quest Map — it will auto-generate the roadmap
+          setActiveTab('quest-map')
+        }
+      } catch (e) { console.error('Auto role-gap failed', e) }
+    } else {
+      setActiveTab('profile-scan')
     }
   }
 
@@ -116,49 +158,39 @@ function App() {
 
   useEffect(() => {
     fetchMetrics()
+    // Load saved profile scan from DynamoDB on mount
+    getProfileScan('user_1').then(r => { if (r) setScanResult(r) }).catch(() => {})
+    // Load saved role gap result from DynamoDB on mount (ensures Quest Map works on reload)
+    if (!gapResult) {
+      getPersistedRoleGap('user_1').then(r => { if (r) updateGapResult(r) }).catch(() => {})
+    }
   }, [])
 
   // Auto-sync market data if cache is empty or older than 2 hours
+  // ── Market data: fetch once on mount, then every 2 hours ─────────────────
   useEffect(() => {
-    const TWO_HOURS = 2 * 60 * 60 * 1000
-    const stale = !marketStats?.refreshed_at ||
-      Date.now() - new Date(marketStats.refreshed_at).getTime() > TWO_HOURS
-    if (stale) {
+    const fetchMarket = () => {
       refreshMarketData().then(data => {
         const stats = { ...data, refreshed_at: new Date().toISOString() }
         setMarketStats(stats)
         localStorage.setItem('careeros_market_stats', JSON.stringify(stats))
       }).catch(() => {})
     }
-  }, [])
-
-  // Fetch per-skill mastery from Mastery Tracker
-  useEffect(() => {
-    getUserMastery('user_1').then(setMasteryData).catch(() => {})
-  }, [])
-
-  // Add auto-refresh for mastery tracker and market stats
-  useEffect(() => {
-    const interval = setInterval(() => {
-      getUserMastery('user_1').then(setMasteryData).catch(() => {})
-    }, 60000) // auto-refresh every 60s
-    getUserMastery('user_1').then(setMasteryData).catch(() => {})
+    // Only fetch if cache is stale (>2h) or empty
+    const TWO_HOURS = 2 * 60 * 60 * 1000
+    const stale = !marketStats?.refreshed_at ||
+      Date.now() - new Date(marketStats.refreshed_at).getTime() > TWO_HOURS
+    if (stale) fetchMarket()
+    const interval = setInterval(fetchMarket, TWO_HOURS)
     return () => clearInterval(interval)
   }, [])
+
+  // ── Mastery data: fetch once on mount, then every 60s ── ────────────────
   useEffect(() => {
-    refreshMarketData().then(data => {
-      const stats = { ...data, refreshed_at: new Date().toISOString() }
-      setMarketStats(stats)
-      localStorage.setItem('careeros_market_stats', JSON.stringify(stats))
-    }).catch(() => {})
-    // Agentic auto-refresh market stats every 2 hours
+    getUserMastery('user_1').then(setMasteryData).catch(() => {})
     const interval = setInterval(() => {
-      refreshMarketData().then(data => {
-        const stats = { ...data, refreshed_at: new Date().toISOString() }
-        setMarketStats(stats)
-        localStorage.setItem('careeros_market_stats', JSON.stringify(stats))
-      }).catch(() => {})
-    }, 7200000)
+      getUserMastery('user_1').then(setMasteryData).catch(() => {})
+    }, 60000)
     return () => clearInterval(interval)
   }, [])
 
@@ -196,11 +228,9 @@ function App() {
   useEffect(() => {
     // Run once on mount, then every 45 seconds
     triggerAgentLoop()
-    const interval = setInterval(triggerAgentLoop, 45000)
+    const interval = setInterval(triggerAgentLoop, 1200000) // every 20 minutes — reduces Bedrock quota contention
     return () => clearInterval(interval)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (loading) return <div className="loading-state"><Sparkles className="spin" /></div>
 
   // Single source-of-truth for "all skills this user knows"
   // Merges: profile scan results + practised skills from backend + manually entered chips
@@ -211,6 +241,19 @@ function App() {
     ...userAddedSkills,
   ])]
 
+  // Sync allKnownSkills to DynamoDB whenever the combined set changes
+  // so the agentic loop always sees the latest skills
+  const allSkillsKey = allKnownSkills.slice().sort().join('|')
+  const prevSkillsKey = useRef('')
+  useEffect(() => {
+    if (allSkillsKey && allSkillsKey !== prevSkillsKey.current) {
+      prevSkillsKey.current = allSkillsKey
+      syncSkills('user_1', allKnownSkills).catch(() => {})
+    }
+  }, [allSkillsKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (loading) return <div className="loading-state"><Sparkles className="spin" /></div>
+
   return (
     <div className="app-container">
       {!onboardingData && <Onboarding onComplete={handleOnboardingComplete} />}
@@ -218,9 +261,9 @@ function App() {
       <main className="main-content">
         <DashboardHeader metrics={metrics} />
 
-        {activeTab === 'dashboard' && <Dashboard metrics={metrics} setActiveTab={setActiveTab} userName={userName} onSetName={handleSetName} masteryData={masteryData} marketStats={marketStats} agentReport={agentReport} agentRunning={agentRunning} agentStep={agentStep} agentLog={agentLog} onRunAgent={triggerAgentLoop} />}
+        {activeTab === 'dashboard' && <Dashboard metrics={metrics} setActiveTab={setActiveTab} userName={userName} onSetName={handleSetName} masteryData={masteryData} marketStats={marketStats} />}
         {activeTab === 'profile-scan' && (
-          <ProfileScan result={scanResult} setResult={setScanResult} />
+          <ProfileScan result={scanResult} setResult={setScanResult} loading={scanLoading} />
         )}
         {activeTab === 'role-gap' && (
           <RoleGap
@@ -237,7 +280,7 @@ function App() {
               localStorage.setItem('careeros_added_skills', JSON.stringify(updated))
             }}
             gapResult={gapResult}
-            setGapResult={setGapResult}
+            setGapResult={updateGapResult}
             selectedRole={selectedRole}
             setSelectedRole={setSelectedRole}
             marketStats={marketStats}
@@ -249,9 +292,51 @@ function App() {
         )}
         {activeTab === 'quest-map' && (
           <QuestMap
+            key={questMapKey}
             gapResult={gapResult}
             userSkills={allKnownSkills}
             selectedRole={selectedRole}
+            masteryData={masteryData}
+            userId="user_1"
+            fetchMetrics={fetchMetrics}
+            onRoadmapComplete={(newSkills) => {
+              if (!newSkills?.length) return
+              const updated = [...new Set([...userAddedSkills, ...newSkills])]
+              setUserAddedSkills(updated)
+              localStorage.setItem('careeros_added_skills', JSON.stringify(updated))
+              // Re-fetch metrics so dashboard + stats reflect new XP/level
+              fetchMetrics()
+
+              // ── Agentic auto-advance: re-analyze gap → generate next roadmap ──
+              if (selectedRole) {
+                // Build updated skill list including newly learned skills
+                const latestSkills = [...new Set([
+                  ...(scanResult?.technical_skills || []),
+                  ...(scanResult?.github_analysis?.primary_languages || []),
+                  ...updated,
+                  ...(metrics?.learned_skills || []),
+                ])]
+                // 3-second delay so user sees the completion celebration
+                setTimeout(async () => {
+                  try {
+                    const resp = await fetch(`${BASE_URL}/analyze-role`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ user_skills: latestSkills, selected_role: selectedRole, user_id: 'user_1' }),
+                    })
+                    if (resp.ok) {
+                      const newGap = await resp.json()
+                      // Only auto-advance if there are still missing skills to learn
+                      if (newGap.missing_skills?.length > 0) {
+                        updateGapResult(newGap)
+                        // Force QuestMap remount so it auto-generates a new roadmap
+                        setQuestMapKey(prev => prev + 1)
+                      }
+                    }
+                  } catch (e) { console.error('Auto-advance role-gap failed', e) }
+                }, 3000)
+              }
+            }}
           />
         )}
         {activeTab === 'daily-quest' && (
@@ -263,7 +348,7 @@ function App() {
           />
         )}
         {activeTab === 'stats' && (
-          <PlayerStats metrics={metrics} fetchMetrics={fetchMetrics} selectedRole={selectedRole} scanResult={scanResult} masteryData={masteryData} />
+          <PlayerStats metrics={metrics} fetchMetrics={fetchMetrics} selectedRole={selectedRole} scanResult={scanResult} masteryData={masteryData} userName={userName} />
         )}
         {/* Placeholders for other tabs */}
         {activeTab !== 'dashboard' && activeTab !== 'profile-scan' && activeTab !== 'role-gap' && activeTab !== 'quest-map' && activeTab !== 'daily-quest' && activeTab !== 'stats' && (
@@ -342,9 +427,9 @@ const Onboarding = ({ onComplete }) => {
         {step === 1 && (
           <div>
             <div style={{ fontSize: '2.5rem', marginBottom: '0.75rem' }}>👋</div>
-            <h2 style={{ margin: '0 0 0.5rem' }}>Welcome to <span style={{ color: 'var(--accent-primary)' }}>CareerOS</span></h2>
+            <h2 style={{ margin: '0 0 0.5rem' }}>Welcome to <span style={{ color: 'var(--accent-primary)' }}>Career Coach</span></h2>
             <p style={{ color: 'var(--text-muted)', marginBottom: '2rem', fontSize: '0.9rem', lineHeight: 1.6 }}>
-              AI-powered career acceleration. Skill gaps → ranked roadmap → daily quests → verified mastery.
+              AI-powered career acceleration. Skill gaps → ranked roadmap → eat the frog → verified mastery.
             </p>
             <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.85rem', color: 'var(--text-muted)' }}>What should we call you?</label>
             <input
@@ -575,7 +660,7 @@ const CareerIntelligence = ({ metrics, masteryData, marketStats, setActiveTab })
             </div>
             <div style={{ fontWeight: 800, fontSize: '1.35rem', color: 'var(--text-primary)', lineHeight: 1.2 }}>{nextSkill}</div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>Chosen based on real job market demand and where you have the biggest gap</div>
-            <div style={{ marginTop: '0.3rem', fontSize: '0.78rem', color: 'var(--accent-primary)', fontWeight: 700 }}>→ Go to Daily Quest to start working on this</div>
+            <div style={{ marginTop: '0.3rem', fontSize: '0.78rem', color: 'var(--accent-primary)', fontWeight: 700 }}>→ Go to Eat the Frog to start working on this</div>
           </div>
         )}
 
@@ -594,7 +679,7 @@ const CareerIntelligence = ({ metrics, masteryData, marketStats, setActiveTab })
                 <span style={{ fontSize: '0.78rem', fontWeight: 400, color: 'var(--text-muted)', marginLeft: '0.45rem' }}>jobs analyzed</span>
               </div>
               <div style={{ display: 'flex', gap: '0.6rem', marginTop: '0.65rem', flexWrap: 'wrap' }}>
-                {[['RemoteOK', marketStats.sources?.remoteok, '#22C55E'], ['Indeed/LI', marketStats.sources?.jsearch, '#00F0FF'], ['Adzuna', marketStats.sources?.adzuna, '#F59E0B']].map(([label, count, color]) => (
+                {[['RemoteOK', marketStats.sources?.remoteok, '#22C55E'], ['Indeed/LI', marketStats.sources?.jsearch, '#00F0FF'], ['Adzuna', marketStats.sources?.adzuna, '#F59E0B']].filter(([, count]) => count == null || count > 0).map(([label, count, color]) => (
                   <span key={label} style={{ fontSize: '0.7rem', fontWeight: 700, color, background: `${color}18`, padding: '0.2rem 0.55rem', borderRadius: '999px', border: `1px solid ${color}30` }}>
                     {label}: {count ?? 0}
                   </span>
@@ -643,164 +728,10 @@ const CareerIntelligence = ({ metrics, masteryData, marketStats, setActiveTab })
   )
 }
 
-const LOOP_STEPS = ['OBSERVE', 'REASON', 'PLAN', 'ACT', 'REFLECT']
-const STEP_ICONS = { OBSERVE: '👁', REASON: '🧠', PLAN: '📋', ACT: '⚡', REFLECT: '🔄' }
-const STEP_DESC = {
-  OBSERVE: 'Checking your skills, progress and what jobs are trending right now',
-  REASON: 'Figuring out which skill will have the biggest impact on your career',
-  PLAN: 'Deciding what to work on and in what order',
-  ACT: 'Running: skill gap analysis → impact ranking → roadmap update',
-  REFLECT: 'Saving results and updating your next recommended skill',
-}
-
-const AgentActivityFeed = ({ agentReport, agentRunning, agentStep, agentLog, onRunAgent }) => {
-  return (
-    <div className="result-card" style={{ marginBottom: '1.5rem', border: '1px solid rgba(0,240,255,0.3)', background: 'linear-gradient(135deg, rgba(0,10,30,0.95) 0%, rgba(0,5,20,0.98) 100%)' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.2rem' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-            <span style={{ fontSize: '1.1rem' }}>🤖</span>
-            <span style={{ fontWeight: 800, fontSize: '1rem', color: 'var(--accent-primary)' }}>Your AI Career Coach</span>
-            {agentRunning && (
-              <span style={{ background: 'rgba(0,240,255,0.15)', border: '1px solid rgba(0,240,255,0.4)', borderRadius: '999px', padding: '0.1rem 0.6rem', fontSize: '0.62rem', letterSpacing: '0.08em', color: 'var(--accent-primary)', animation: 'pulse 1.5s infinite' }}>
-                RUNNING
-              </span>
-            )}
-            {!agentRunning && agentReport && (
-              <span style={{ background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.4)', borderRadius: '999px', padding: '0.1rem 0.6rem', fontSize: '0.62rem', letterSpacing: '0.08em', color: '#4ade80' }}>
-                IDLE
-              </span>
-            )}
-          </div>
-          <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
-            Autonomous · Observe → Reason → Plan → Act → Reflect · Auto-runs every 45s
-          </div>
-        </div>
-        <button
-          onClick={onRunAgent}
-          disabled={agentRunning}
-          style={{
-            padding: '0.4rem 1rem', borderRadius: '8px', border: '1px solid rgba(0,240,255,0.4)',
-            background: agentRunning ? 'rgba(0,240,255,0.05)' : 'rgba(0,240,255,0.12)',
-            color: 'var(--accent-primary)', fontSize: '0.78rem', fontWeight: 700,
-            cursor: agentRunning ? 'not-allowed' : 'pointer', opacity: agentRunning ? 0.5 : 1,
-          }}
-        >
-          {agentRunning ? 'Running…' : '▶ Run Agent Now'}
-        </button>
-      </div>
-
-      {/* Loop Step Visualizer */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', marginBottom: '1.2rem', overflowX: 'auto', paddingBottom: '0.2rem' }}>
-        {LOOP_STEPS.map((step, i) => {
-          const isActive = agentRunning && agentStep === step
-          const isDone = agentReport && !agentRunning
-          return (
-            <div key={step} style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0 }}>
-              <div style={{
-                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.2rem',
-                padding: '0.5rem 0.75rem', borderRadius: '10px', minWidth: '68px',
-                background: isActive ? 'rgba(0,240,255,0.18)' : isDone ? 'rgba(34,197,94,0.1)' : 'rgba(255,255,255,0.03)',
-                border: `1px solid ${isActive ? 'rgba(0,240,255,0.6)' : isDone ? 'rgba(34,197,94,0.3)' : 'rgba(255,255,255,0.08)'}`,
-                transition: 'all 0.3s',
-              }}>
-                <span style={{ fontSize: '1.1rem' }}>{STEP_ICONS[step]}</span>
-                <span style={{ fontSize: '0.62rem', fontWeight: 700, letterSpacing: '0.06em', color: isActive ? 'var(--accent-primary)' : isDone ? '#4ade80' : 'var(--text-muted)' }}>
-                  {step}
-                </span>
-              </div>
-              {i < LOOP_STEPS.length - 1 && (
-                <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: '0.8rem' }}>→</span>
-              )}
-            </div>
-          )
-        })}
-      </div>
-
-      {/* Active step description */}
-      {agentRunning && agentStep && (
-        <div style={{ background: 'rgba(0,240,255,0.07)', border: '1px solid rgba(0,240,255,0.2)', borderRadius: '8px', padding: '0.75rem 1rem', marginBottom: '1rem', fontSize: '0.78rem', color: 'var(--accent-primary)' }}>
-          <strong>{agentStep}:</strong> {STEP_DESC[agentStep]}
-        </div>
-      )}
-
-      {/* Last Agent Report */}
-      {agentReport && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
-          {/* Reasoning */}
-          <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '10px', padding: '0.9rem', border: '1px solid rgba(255,255,255,0.07)' }}>
-            <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.5rem' }}>🧠 What Your Coach Is Thinking</div>
-            <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{agentReport.reasoning || '—'}</div>
-          </div>
-          {/* Actions taken */}
-          <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '10px', padding: '0.9rem', border: '1px solid rgba(255,255,255,0.07)' }}>
-            <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.5rem' }}>⚡ What Your Coach Did</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
-              {(agentReport.actions_taken || []).map((a, i) => (
-                <span key={i} style={{ fontSize: '0.75rem', color: a.startsWith('✓') ? '#4ade80' : '#f87171' }}>{a}</span>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Outcomes */}
-      {agentReport?.outcomes && Object.keys(agentReport.outcomes).length > 0 && (
-        <div style={{ background: 'rgba(34,197,94,0.06)', border: '1px solid rgba(34,197,94,0.2)', borderRadius: '10px', padding: '0.9rem', marginBottom: '1rem' }}>
-          <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.6rem' }}>✅ Outcomes</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-            {agentReport.outcomes.next_priority_skill && (
-              <span style={{ background: 'rgba(0,240,255,0.12)', border: '1px solid rgba(0,240,255,0.3)', borderRadius: '8px', padding: '0.25rem 0.65rem', fontSize: '0.74rem', color: 'var(--accent-primary)', fontWeight: 600 }}>
-                🎯 Next: {agentReport.outcomes.next_priority_skill}
-              </span>
-            )}
-            {agentReport.outcomes.alignment_score !== undefined && (
-              <span style={{ background: 'rgba(255,255,255,0.06)', borderRadius: '8px', padding: '0.25rem 0.65rem', fontSize: '0.74rem', color: 'var(--text-secondary)' }}>
-                📊 Alignment: {Math.round(agentReport.outcomes.alignment_score * 100)}%
-              </span>
-            )}
-            {(agentReport.outcomes.top_gaps || []).map(g => (
-              <span key={g} style={{ background: 'rgba(251,146,60,0.1)', border: '1px solid rgba(251,146,60,0.25)', borderRadius: '8px', padding: '0.25rem 0.65rem', fontSize: '0.74rem', color: '#fb923c' }}>⚠ Gap: {g}</span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Agent message */}
-      {agentReport?.agent_message && (
-        <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', fontStyle: 'italic', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '0.75rem' }}>
-          💬 {agentReport.agent_message}
-          {agentReport.agent_run_at && (
-            <span style={{ marginLeft: '0.6rem', fontSize: '0.68rem', color: 'rgba(255,255,255,0.3)' }}>
-              · {new Date(agentReport.agent_run_at).toLocaleTimeString()}
-            </span>
-          )}
-        </div>
-      )}
-
-      {/* History */}
-      {agentLog.length > 1 && (
-        <div style={{ marginTop: '0.75rem', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '0.75rem' }}>
-          <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.4rem' }}>Agent Run History</div>
-          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-            {agentLog.slice(1).map((r, i) => (
-              <span key={i} style={{ fontSize: '0.65rem', background: 'rgba(255,255,255,0.05)', borderRadius: '6px', padding: '0.2rem 0.5rem', color: 'var(--text-muted)' }}>
-                {new Date(r.agent_run_at).toLocaleTimeString()} · {r.outcomes?.next_priority_skill || 'no skill'}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-const Dashboard = ({ metrics, setActiveTab, userName, onSetName, masteryData, marketStats, agentReport, agentRunning, agentStep, agentLog, onRunAgent }) => {
+const Dashboard = ({ metrics, setActiveTab, userName, onSetName, masteryData, marketStats }) => {
   return (
     <>
       <WelcomeSection metrics={metrics} userName={userName} onSetName={onSetName} />
-      <AgentActivityFeed agentReport={agentReport} agentRunning={agentRunning} agentStep={agentStep} agentLog={agentLog} onRunAgent={onRunAgent} />
       <CareerIntelligence metrics={metrics} masteryData={masteryData} marketStats={marketStats} setActiveTab={setActiveTab} />
       <StatsGrid metrics={metrics} />
       <ActionGrid setActiveTab={setActiveTab} />
@@ -809,42 +740,7 @@ const Dashboard = ({ metrics, setActiveTab, userName, onSetName, masteryData, ma
   )
 }
 
-const ProfileScan = ({ result, setResult }) => {
-  const [file, setFile] = useState(null)
-  const [username, setUsername] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const fileInputRef = useRef(null)
-
-  const handleFileChange = (e) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0])
-    }
-  }
-
-  const handleAnalyze = async () => {
-    if (!file && !username) {
-      setError('Please upload a resume or enter a GitHub username.')
-      return
-    }
-
-    setLoading(true)
-    setError(null)
-    const formData = new FormData()
-    if (file) formData.append('resume', file)
-    if (username) formData.append('github_username', username)
-
-    try {
-      const data = await analyzeProfile(formData)
-      setResult(data)
-    } catch (err) {
-      console.error('Error analyzing profile:', err)
-      setError(err.message || 'Failed to analyze profile. Please try again.')
-    } finally {
-      setLoading(false)
-    }
-  }
-
+const ProfileScan = ({ result, loading }) => {
   // Colors for the chart matching your theme
   const COLORS = ['#00F0FF', '#22C55E', '#F59E0B', '#8B5CF6', '#EC4899']
 
@@ -855,64 +751,22 @@ const ProfileScan = ({ result, setResult }) => {
           <ScanFace size={32} color="var(--accent-primary)" />
           <h2>Profile Analysis</h2>
         </div>
-        <p className="scan-subtitle">Extract skills and insights from your resume and GitHub.</p>
+        <p className="scan-subtitle">Skills and insights extracted from your resume and GitHub.</p>
       </div>
 
-      {!result ? (
-        <>
-          <div className="input-grid">
-            <div className="input-card">
-              <div className="card-label">
-                <FileText size={18} color="var(--accent-secondary)" />
-                Resume PDF
-              </div>
-              <div
-                className="upload-area"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleFileChange}
-                  hidden
-                  accept=".pdf"
-                />
-                <Upload size={32} style={{ marginBottom: '1rem', opacity: 0.5 }} />
-                <span>{file ? file.name : "Click to upload PDF"}</span>
-              </div>
-            </div>
-
-            <div className="input-card">
-              <div className="card-label">
-                <Github size={18} color="var(--accent-primary)" />
-                GitHub Username
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', height: '160px', justifyContent: 'center' }}>
-                <input
-                  type="text"
-                  className="custom-input"
-                  placeholder="e.g. octocat"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                />
-                <p className="input-helper">Public repos will be analyzed for languages & activity.</p>
-              </div>
-            </div>
-          </div>
-
-          {error && (
-            <p style={{ color: 'var(--accent-orange)', margin: '0.5rem 0 1rem', fontSize: '0.9rem' }}>⚠ {error}</p>
-          )}
-          <button
-            className="analyze-btn"
-            onClick={handleAnalyze}
-            disabled={loading}
-            style={{ opacity: loading ? 0.7 : 1, cursor: loading ? 'not-allowed' : 'pointer' }}
-          >
-            {loading ? <Sparkles className="spin" size={20} /> : <Sparkles size={20} />}
-            {loading ? "Analyzing..." : "Analyze Profile"}
-          </button>
-        </>
+      {loading ? (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1.25rem', padding: '5rem 0' }}>
+          <Sparkles className="spin" size={36} color="var(--accent-primary)" />
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem', margin: 0 }}>Analysing your profile…</p>
+        </div>
+      ) : !result ? (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1rem', padding: '5rem 2rem', textAlign: 'center' }}>
+          <span style={{ fontSize: '3rem' }}>📄</span>
+          <h3 style={{ margin: 0 }}>No profile analysed yet</h3>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', maxWidth: '380px', lineHeight: 1.6, margin: 0 }}>
+            Upload your resume or add your GitHub username during onboarding — your full skill analysis will appear here automatically.
+          </p>
+        </div>
       ) : (
         <div className="results-container">
 
@@ -1154,7 +1008,7 @@ const Sidebar = ({ activeTab, setActiveTab, metrics }) => {
     { id: 'profile-scan', label: 'Profile Scan', icon: ScanFace },
     { id: 'role-gap', label: 'Role Gap', icon: Target },
     { id: 'quest-map', label: 'Quest Map', icon: Map },
-    { id: 'daily-quest', label: 'Daily Quest', icon: Swords },
+    { id: 'daily-quest', label: 'Eat the Frog', icon: Swords },
     { id: 'stats', label: 'Stats', icon: BarChart2 },
   ]
 
@@ -1172,7 +1026,7 @@ const Sidebar = ({ activeTab, setActiveTab, metrics }) => {
           <Zap size={28} fill="currentColor" />
         </div>
         <div>
-          CareerOS
+          Career Coach
           <span className="brand-subtitle">CO-PILOT</span>
         </div>
       </div>
@@ -1258,7 +1112,7 @@ const WelcomeSection = ({ metrics, userName, onSetName }) => {
             {[
               { step: '1', text: 'Scan your resume or GitHub to extract your skills', action: 'Profile Scan', tab: 'profile-scan' },
               { step: '2', text: 'Run a Role Gap analysis to see exactly what you\'re missing', action: 'Role Gap', tab: 'role-gap' },
-              { step: '3', text: 'Complete a Daily Quest to earn XP and build verified skills', action: 'Daily Quest', tab: 'daily-quest' },
+              { step: '3', text: 'Complete Eat the Frog to earn XP and build verified skills', action: 'Eat the Frog', tab: 'daily-quest' },
             ].map(({ step, text }) => (
               <div key={step} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
                 <span style={{ background: 'rgba(0,240,255,0.15)', borderRadius: '999px', width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.7rem', fontWeight: 700, color: 'var(--accent-primary)', flexShrink: 0 }}>{step}</span>
@@ -1302,7 +1156,7 @@ const WelcomeSection = ({ metrics, userName, onSetName }) => {
           )}
           <p>Your career quest awaits. Complete quests to earn XP and level up.</p>
 
-          <div className="level-info" title="Earn XP by completing daily quests, verifying skills, and finishing your roadmap steps. Every 500 XP = 1 level up.">
+          <div className="level-info" title="Earn XP by completing Eat the Frog challenges, verifying skills, and finishing your roadmap steps. Every 500 XP = 1 level up.">
             <div className="level-text">
               <span>LVL {metrics?.level || 1} <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>NEXT LEVEL</span></span>
               <span style={{ color: 'var(--text-muted)' }}>{metrics ? metrics.xp % 500 : 0}/500</span>
@@ -1584,7 +1438,8 @@ const RoleGap = ({ userSkills, userAddedSkills = [], onAddSkill, onRemoveSkill, 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_skills: allSkills,
-          selected_role: selectedRole
+          selected_role: selectedRole,
+          user_id: 'user_1'
         })
       })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -1626,7 +1481,7 @@ const RoleGap = ({ userSkills, userAddedSkills = [], onAddSkill, onRemoveSkill, 
           { label: 'RemoteOK', count: marketStats?.sources?.remoteok, color: '#22C55E' },
           { label: 'Indeed / LinkedIn', count: marketStats?.sources?.jsearch, color: '#00F0FF' },
           { label: 'Adzuna', count: marketStats?.sources?.adzuna, color: '#F59E0B' },
-        ].map(src => (
+        ].filter(src => src.count == null || src.count > 0).map(src => (
           <span key={src.label} style={{
             display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
             padding: '0.2rem 0.6rem', borderRadius: '999px',
@@ -1822,24 +1677,31 @@ const RoleGap = ({ userSkills, userAddedSkills = [], onAddSkill, onRemoveSkill, 
                   const maxImportance = Math.max(...gapResult.missing_skills.map(s => s.importance), 1)
                   const barPct = Math.round((item.importance / maxImportance) * 100)
                   const iTop = i === 0
+                  const isLearned = userAddedSkills.some(s => s.toLowerCase() === item.skill.toLowerCase())
                   return (
                     <div key={i} style={{
                       padding: '0.9rem 1rem',
-                      background: iTop ? 'rgba(245,158,11,0.06)' : 'var(--bg-primary)',
+                      background: isLearned ? 'rgba(34,197,94,0.05)' : iTop ? 'rgba(245,158,11,0.06)' : 'var(--bg-primary)',
                       borderRadius: '10px',
-                      border: iTop ? '1px solid rgba(245,158,11,0.25)' : '1px solid var(--border-color)',
+                      border: isLearned ? '1px solid rgba(34,197,94,0.3)' : iTop ? '1px solid rgba(245,158,11,0.25)' : '1px solid var(--border-color)',
+                      opacity: isLearned ? 0.8 : 1,
                     }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                          {iTop && <span style={{ fontSize: '0.65rem', fontWeight: 700, color: '#F59E0B', border: '1px solid #F59E0B', borderRadius: '999px', padding: '0.1rem 0.45rem', textTransform: 'uppercase' }}>Top Priority</span>}
-                          <div style={{ fontWeight: 700, color: 'var(--text-primary)', fontSize: '0.95rem' }}>{item.skill}</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                          {isLearned && (
+                            <span style={{ fontSize: '0.65rem', fontWeight: 800, color: '#22C55E', border: '1px solid rgba(34,197,94,0.4)', borderRadius: '999px', padding: '0.1rem 0.5rem', textTransform: 'uppercase' }}>
+                              ✓ Learned
+                            </span>
+                          )}
+                          {!isLearned && iTop && <span style={{ fontSize: '0.65rem', fontWeight: 700, color: '#F59E0B', border: '1px solid #F59E0B', borderRadius: '999px', padding: '0.1rem 0.45rem', textTransform: 'uppercase' }}>Top Priority</span>}
+                          <div style={{ fontWeight: 700, color: isLearned ? '#22C55E' : 'var(--text-primary)', fontSize: '0.95rem', textDecoration: isLearned ? 'line-through' : 'none' }}>{item.skill}</div>
                         </div>
-                        <div style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--accent-orange)', background: 'rgba(245,158,11,0.1)', padding: '0.2rem 0.55rem', borderRadius: '6px' }}>
-                          Impact {item.importance}
+                        <div style={{ fontSize: '0.78rem', fontWeight: 700, color: isLearned ? '#22C55E' : 'var(--accent-orange)', background: isLearned ? 'rgba(34,197,94,0.1)' : 'rgba(245,158,11,0.1)', padding: '0.2rem 0.55rem', borderRadius: '6px' }}>
+                          {isLearned ? 'Done' : `Impact ${item.importance}`}
                         </div>
                       </div>
                       <div style={{ height: '4px', background: 'var(--bg-tertiary)', borderRadius: '999px', overflow: 'hidden', marginBottom: '0.45rem' }}>
-                        <div style={{ height: '100%', width: `${barPct}%`, background: iTop ? '#F59E0B' : 'var(--accent-primary)', borderRadius: '999px', transition: 'width 0.6s ease' }} />
+                        <div style={{ height: '100%', width: `${isLearned ? 100 : barPct}%`, background: isLearned ? '#22C55E' : iTop ? '#F59E0B' : 'var(--accent-primary)', borderRadius: '999px', transition: 'width 0.6s ease' }} />
                       </div>
                       <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{item.why_this_skill_matters}</div>
                     </div>
@@ -1909,52 +1771,188 @@ const RESOURCE_META = {
   course:   { icon: '🎓', label: 'Course',   color: '#8B5CF6', bg: 'rgba(139,92,246,0.08)' },
 }
 
-const QuestMap = ({ gapResult, userSkills, selectedRole }) => {
+const QuestMap = ({ gapResult, userSkills, selectedRole, masteryData, userId, fetchMetrics, onRoadmapComplete }) => {
   const [loading, setLoading] = useState(false)
   const [roadmap, setRoadmap] = useState(null)
   const [error, setError] = useState(null)
+  const [expandedPhase, setExpandedPhase] = useState(0)
+  const [hintLevels, setHintLevels] = useState({}) // { phaseIdx: 0|1|2|3 }
+  const [expandedTasks, setExpandedTasks] = useState({}) // { phaseIdx: bool }
+  const [roadmapCompleted, setRoadmapCompleted] = useState(false)
+  const [completionData, setCompletionData] = useState(null) // { total_xp, skills }
 
-  // Resources drawer state
-  const [drawer, setDrawer] = useState(null)   // { task, skill, day }
-  const [resources, setResources] = useState([])
-  const [repos, setRepos] = useState([])
-  const [loadingRes, setLoadingRes] = useState(false)
-  const [resError, setResError] = useState(null)
+  // Submission state per phase: { phaseIdx: { url, submitting, result, error } }
+  const [submissions, setSubmissions] = useState({})
+  // Completed phases (populated from roadmap data on load)
+  const [completedPhases, setCompletedPhases] = useState({}) // { phaseIdx: bool }
+
+  const _uid = userId || 'user_1'
+  const autoGenTriggered = useRef(false) // prevent re-triggering auto-generate
+
+  // Load persisted roadmap on mount
+  useEffect(() => {
+    getPersistedRoadmap(_uid)
+      .then(r => {
+        if (r?.status === 'generating') {
+          // Generation in progress — start polling
+          setLoading(true)
+          const pollOnMount = async () => {
+            let polls = 0
+            const poll = async () => {
+              polls++
+              try {
+                const result = await getPersistedRoadmap(_uid)
+                if (result?.status === 'ready' && result?.phases?.length) {
+                  setRoadmap(result)
+                  const done = {}
+                  result.phases.forEach((p, i) => { if (p.completed) done[i] = true })
+                  setCompletedPhases(done)
+                  if (result.phases.length > 0 && result.phases.every(p => p.completed)) {
+                    setRoadmapCompleted(true)
+                  }
+                  setLoading(false)
+                  return
+                }
+                if (result?.status === 'failed') {
+                  setError(result.error || 'Roadmap generation failed.')
+                  setLoading(false)
+                  return
+                }
+              } catch (_) {}
+              if (polls < 60) setTimeout(poll, 4000)
+              else { setLoading(false) }
+            }
+            setTimeout(poll, 2000)
+          }
+          pollOnMount()
+        } else if (r?.phases) {
+          setRoadmap(r)
+          // Restore completed state from persisted data
+          const done = {}
+          r.phases.forEach((p, i) => { if (p.completed) done[i] = true })
+          setCompletedPhases(done)
+          // Check if already fully completed
+          if (r.phases.length > 0 && r.phases.every(p => p.completed)) {
+            setRoadmapCompleted(true)
+          }
+        }
+      })
+      .catch(() => {})
+      .finally(() => setPersistChecked(true))
+  }, [_uid])
 
   const handleGenerate = async () => {
     if (!gapResult || !selectedRole) return
     setLoading(true)
     setError(null)
     try {
-      const data = await generateCareerPlan({ user_skills: userSkills, selected_role: selectedRole })
-      setRoadmap(data)
+      // Build mastery_levels from masteryData
+      const masteryLevels = {}
+      if (masteryData?.mastery_levels) {
+        masteryData.mastery_levels.forEach(m => { masteryLevels[m.skill] = m.level })
+      }
+      const missingSkills = (gapResult.missing_skills || gapResult.ranked_skills || [])
+        .map(s => ({ skill: s.skill, importance: s.importance ?? s.impact_score ?? 0.5 }))
+
+      // Kick off async generation (returns immediately)
+      await generateDynamicRoadmap({
+        user_id: userId || 'user_1',
+        user_skills: userSkills || [],
+        target_role: selectedRole,
+        missing_skills: missingSkills,
+        mastery_levels: masteryLevels,
+      })
+
+      // Poll for completion
+      const POLL_INTERVAL = 4000 // 4 seconds
+      const MAX_POLLS = 60      // up to ~4 minutes
+      let polls = 0
+      const poll = async () => {
+        polls++
+        try {
+          const result = await getPersistedRoadmap(_uid)
+          if (result?.status === 'ready' && result?.phases?.length) {
+            setRoadmap(result)
+            setExpandedPhase(0)
+            setHintLevels({})
+            setCompletedPhases({})
+            setSubmissions({})
+            setRoadmapCompleted(false)
+            setCompletionData(null)
+            setLoading(false)
+            return
+          }
+          if (result?.status === 'failed') {
+            setError(result.error || 'Roadmap generation failed. Please try again.')
+            setLoading(false)
+            return
+          }
+        } catch (_) { /* ignore poll errors, keep trying */ }
+        if (polls < MAX_POLLS) {
+          setTimeout(poll, POLL_INTERVAL)
+        } else {
+          setError('Roadmap generation is taking longer than expected. Please refresh the page in a minute.')
+          setLoading(false)
+        }
+      }
+      // Start polling after a short delay to let Lambda spin up
+      setTimeout(poll, 3000)
     } catch (err) {
-      setError(err.message || 'Failed to generate career plan. Please try again.')
-    } finally {
+      setError(err.message || 'Failed to generate roadmap. Please try again.')
       setLoading(false)
     }
   }
 
-  const openDrawer = async (day, weekFocus) => {
-    setDrawer({ task: day.task, description: day.description, skill: weekFocus, day: day.day })
-    setResources([])
-    setRepos([])
-    setResError(null)
-    setLoadingRes(true)
+  // Auto-generate roadmap when gapResult arrives and we have no existing roadmap
+  // (e.g. right after onboarding completes)
+  const [persistChecked, setPersistChecked] = useState(false)
+  useEffect(() => {
+    if (!persistChecked || autoGenTriggered.current || loading || roadmap) return
+    if (gapResult && selectedRole) {
+      autoGenTriggered.current = true
+      handleGenerate()
+    }
+  }, [gapResult, selectedRole, persistChecked]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setSubmissionField = (phaseIdx, fields) => {
+    setSubmissions(prev => ({ ...prev, [phaseIdx]: { ...(prev[phaseIdx] || {}), ...fields } }))
+  }
+
+  const handleSubmitProject = async (phaseIdx) => {
+    const url = (submissions[phaseIdx]?.url || '').trim()
+    if (!url) return
+    setSubmissionField(phaseIdx, { submitting: true, result: null, error: null })
     try {
-      const data = await getLearningResources(day.task, weekFocus, selectedRole || '')
-      setResources(data.resources || [])
-      setRepos(data.repos || [])
-    } catch (e) {
-      setResError('Could not load resources. Try again.')
-    } finally {
-      setLoadingRes(false)
+      const result = await submitPhaseProject(_uid, phaseIdx, url)
+      setSubmissionField(phaseIdx, { submitting: false, result })
+      // Mark phase complete in local state immediately
+      const newCompleted = { ...completedPhases, [phaseIdx]: true }
+      setCompletedPhases(newCompleted)
+      // Refresh XP / level on dashboard + stats
+      if (fetchMetrics) fetchMetrics()
+      // Handle roadmap completion
+      if (result.roadmap_complete) {
+        setRoadmapCompleted(true)
+        setCompletionData({
+          bonus_xp: result.bonus_xp || 500,
+          skills: result.newly_learned_skills || [],
+        })
+        if (onRoadmapComplete) onRoadmapComplete(result.newly_learned_skills || [])
+      }
+    } catch (err) {
+      setSubmissionField(phaseIdx, { submitting: false, error: err.message || 'Evaluation failed. Please try again.' })
     }
   }
 
-  const closeDrawer = () => { setDrawer(null); setResources([]); setRepos([]) }
+  const revealHint = (phaseIdx, level) => {
+    setHintLevels(prev => ({ ...prev, [phaseIdx]: level }))
+  }
 
-  if (!gapResult) {
+  const DIFFICULTY_COLORS = { beginner: '#22C55E', intermediate: '#F59E0B', advanced: '#EF4444' }
+  const RESOURCE_ICONS = { documentation: '📄', course_module: '🎓', video: '▶', github_example: '', article: '📝' }
+  const RESOURCE_COLORS = { documentation: '#00F0FF', course_module: '#8B5CF6', video: '#FF0000', github_example: '#fff', article: '#F59E0B' }
+
+  if (!gapResult && !roadmap) {
     return (
       <div className="scan-container">
         <div className="scan-header">
@@ -1962,7 +1960,7 @@ const QuestMap = ({ gapResult, userSkills, selectedRole }) => {
             <Map size={32} color="var(--accent-primary)" />
             <h2>Quest Map</h2>
           </div>
-          <p className="scan-subtitle">Complete the Role Gap Analysis first to unlock your quest map.</p>
+          <p className="scan-subtitle">Complete the Role Gap Analysis first to unlock your personalized roadmap.</p>
         </div>
       </div>
     )
@@ -1970,268 +1968,477 @@ const QuestMap = ({ gapResult, userSkills, selectedRole }) => {
 
   return (
     <div className="scan-container">
+      {/* ── Header ── */}
       <div className="scan-header">
         <div className="scan-title">
           <Map size={32} color="var(--accent-primary)" />
           <h2>Quest Map</h2>
         </div>
-        <p className="scan-subtitle">Your personalized 30-day adventure to skill mastery. Click any topic to get learning resources.</p>
+        <p className="scan-subtitle">
+          A personalized multi-phase roadmap built by 5 AI agents — unique projects, calibrated daily challenges, and exact learning resources.
+        </p>
       </div>
 
-      {/* ── Resources Drawer (overlay) ── */}
-      {drawer && (
-        <div
-          onClick={closeDrawer}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)',
-            zIndex: 1000, display: 'flex', justifyContent: 'flex-end',
-            backdropFilter: 'blur(4px)',
-          }}
-        >
-          <div
-            onClick={e => e.stopPropagation()}
-            style={{
-              width: 'min(480px, 100vw)', height: '100%', background: 'var(--bg-secondary)',
-              borderLeft: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column',
-              animation: 'slideInRight 0.22s ease',
-              overflowY: 'auto',
-            }}
-          >
-            {/* Header */}
-            <div style={{
-              padding: '1.5rem 1.5rem 1rem', borderBottom: '1px solid var(--border-color)',
-              position: 'sticky', top: 0, background: 'var(--bg-secondary)', zIndex: 1,
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem' }}>
-                <div>
-                  <div style={{ fontSize: '0.7rem', color: 'var(--accent-primary)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '0.4rem' }}>
-                    Day {drawer.day} · {drawer.skill}
-                  </div>
-                  <h3 style={{ margin: 0, fontSize: '1rem', lineHeight: 1.4, color: 'var(--text-primary)' }}>{drawer.task}</h3>
-                  {drawer.description && (
-                    <p style={{ margin: '0.4rem 0 0', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>{drawer.description}</p>
-                  )}
-                </div>
-                <button
-                  onClick={closeDrawer}
-                  style={{
-                    flexShrink: 0, background: 'var(--bg-tertiary)', border: 'none',
-                    borderRadius: '8px', width: '32px', height: '32px', cursor: 'pointer',
-                    color: 'var(--text-muted)', fontSize: '1.1rem', display: 'flex',
-                    alignItems: 'center', justifyContent: 'center',
-                  }}
-                >✕</button>
-              </div>
-            </div>
-
-            {/* Resource list */}
-            <div style={{ padding: '1.25rem 1.5rem', flex: 1 }}>
-              {loadingRes ? (
-                <div style={{ textAlign: 'center', padding: '3rem 0' }}>
-                  <Sparkles className="spin" size={28} color="var(--accent-primary)" />
-                  <p style={{ color: 'var(--text-muted)', marginTop: '0.75rem', fontSize: '0.88rem' }}>Finding best resources…</p>
-                </div>
-              ) : resError ? (
-                <p style={{ color: 'var(--accent-orange)', fontSize: '0.9rem' }}>⚠ {resError}</p>
-              ) : resources.length === 0 ? (
-                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>No resources found.</p>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-                  {resources.map((r, i) => {
-                    const meta = RESOURCE_META[r.type] || RESOURCE_META.article
-                    return (
-                      <a
-                        key={i}
-                        href={r.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        style={{
-                          display: 'flex', gap: '0.85rem', alignItems: 'flex-start',
-                          background: meta.bg, border: `1px solid ${meta.color}30`,
-                          borderRadius: '12px', padding: '0.9rem 1rem',
-                          textDecoration: 'none', transition: 'transform 0.15s, box-shadow 0.15s',
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = `0 4px 16px ${meta.color}20` }}
-                        onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'none' }}
-                      >
-                        <div style={{
-                          flexShrink: 0, width: '36px', height: '36px', borderRadius: '8px',
-                          background: `${meta.color}18`, display: 'flex', alignItems: 'center',
-                          justifyContent: 'center', fontSize: '1rem',
-                        }}>
-                          {meta.icon}
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.2rem', flexWrap: 'wrap' }}>
-                            <span style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--text-primary)' }}>{r.title}</span>
-                            <span style={{
-                              fontSize: '0.65rem', fontWeight: 700, color: meta.color,
-                              border: `1px solid ${meta.color}`, borderRadius: '999px',
-                              padding: '0.1rem 0.45rem', letterSpacing: '0.05em', textTransform: 'uppercase',
-                            }}>{meta.label}</span>
-                          </div>
-                          <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{r.description}</p>
-                          <div style={{ fontSize: '0.7rem', color: meta.color, marginTop: '0.3rem', opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {r.url}
-                          </div>
-                        </div>
-                        <ExternalLink size={13} style={{ flexShrink: 0, color: 'var(--text-muted)', marginTop: '0.15rem' }} />
-                      </a>
-                    )
-                  })}
-                </div>
-              )}
-
-              {/* ── GitHub Project Repos ── */}
-              {!loadingRes && repos.length > 0 && (
-                <div style={{ marginTop: '1.75rem' }}>
-                  <div style={{
-                    display: 'flex', alignItems: 'center', gap: '0.5rem',
-                    fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)',
-                    letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: '0.75rem',
-                  }}>
-                    <Github size={13} />
-                    Project Ideas — GitHub Repos to Study or Fork
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                    {repos.map((repo, i) => (
-                      <a
-                        key={i}
-                        href={repo.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        style={{
-                          display: 'flex', gap: '0.75rem', alignItems: 'flex-start',
-                          background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
-                          borderRadius: '12px', padding: '0.85rem 1rem',
-                          textDecoration: 'none', transition: 'border-color 0.15s, background 0.15s',
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.18)'; e.currentTarget.style.background = 'rgba(255,255,255,0.06)' }}
-                        onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.07)'; e.currentTarget.style.background = 'rgba(255,255,255,0.03)' }}
-                      >
-                        <div style={{
-                          flexShrink: 0, width: '34px', height: '34px', borderRadius: '8px',
-                          background: 'rgba(255,255,255,0.06)', display: 'flex',
-                          alignItems: 'center', justifyContent: 'center',
-                        }}>
-                          <Github size={16} color="var(--text-secondary)" />
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.2rem', flexWrap: 'wrap' }}>
-                            <span style={{ fontWeight: 700, fontSize: '0.85rem', color: 'var(--accent-primary)', fontFamily: 'monospace' }}>{repo.name}</span>
-                            {repo.stars && repo.stars !== '—' && (
-                              <span style={{ fontSize: '0.7rem', color: '#F59E0B', fontWeight: 600 }}>⭐ {repo.stars}</span>
-                            )}
-                          </div>
-                          <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{repo.description}</p>
-                          {repo.why && (
-                            <p style={{ margin: '0.3rem 0 0', fontSize: '0.74rem', color: 'var(--accent-secondary)', lineHeight: 1.4, fontStyle: 'italic' }}>💡 {repo.why}</p>
-                          )}
-                        </div>
-                        <ExternalLink size={12} style={{ flexShrink: 0, color: 'var(--text-muted)', marginTop: '0.2rem' }} />
-                      </a>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
+      {/* ── Agent Banner ── */}
+      {roadmap?.agent_summary && (
+        <div style={{
+          display: 'flex', gap: '0.6rem', alignItems: 'flex-start',
+          padding: '0.85rem 1.1rem', marginBottom: '1.25rem',
+          background: 'rgba(139,92,246,0.07)', borderRadius: '10px',
+          border: '1px solid rgba(139,92,246,0.2)',
+        }}>
+          <Sparkles size={14} color="#8B5CF6" style={{ flexShrink: 0, marginTop: 2 }} />
+          <span style={{ fontSize: '0.78rem', color: '#8B5CF6', lineHeight: 1.6 }}>{roadmap.agent_summary}</span>
         </div>
       )}
 
-      {!roadmap ? (
+      {/* ── Generate / Regenerate ── */}
+      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+        <button className="analyze-btn" onClick={handleGenerate} disabled={loading} style={{ maxWidth: 280 }}>
+          {loading ? <Sparkles className="spin" size={18} /> : <Sparkles size={18} />}
+          {loading ? 'AI Agents Working…' : roadmap ? 'Regenerate Roadmap' : 'Generate My Roadmap'}
+        </button>
+        {loading && (
+          <span style={{ fontSize: '0.78rem', color: '#8B5CF6', animation: 'pulse 2s infinite' }}>
+            ATLAS · FORGE · QUEST · SAGE agents are crafting your roadmap…
+          </span>
+        )}
+        {roadmap && !loading && (
+          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+            Generated {roadmap.generated_at ? new Date(roadmap.generated_at).toLocaleDateString() : ''} · {roadmap.total_phases} phases for {roadmap.target_role}
+          </span>
+        )}
+      </div>
+
+      {error && <p style={{ color: 'var(--accent-orange)', marginBottom: '1rem', fontSize: '0.9rem' }}>⚠ {error}</p>}
+
+      {/* ── Roadmap Completion Banner ── */}
+      {roadmapCompleted && (
+        <div style={{
+          borderRadius: '14px', padding: '1.5rem 1.75rem', marginBottom: '1.5rem',
+          background: 'linear-gradient(135deg, rgba(34,197,94,0.12) 0%, rgba(0,240,255,0.08) 100%)',
+          border: '1px solid rgba(34,197,94,0.4)',
+          boxShadow: '0 0 32px rgba(34,197,94,0.12)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+            <Trophy size={22} color="#22C55E" />
+            <span style={{ fontSize: '1.1rem', fontWeight: 800, color: '#22C55E' }}>ROADMAP COMPLETE 🎉</span>
+            {completionData?.bonus_xp > 0 && (
+              <span style={{
+                fontSize: '0.78rem', fontWeight: 800, color: 'var(--accent-primary)',
+                background: 'rgba(0,240,255,0.12)', border: '1px solid rgba(0,240,255,0.3)',
+                padding: '0.2rem 0.7rem', borderRadius: '999px',
+              }}>+{completionData.bonus_xp} BONUS XP</span>
+            )}
+          </div>
+          <p style={{ margin: '0 0 0.85rem', fontSize: '0.9rem', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+            You've submitted every phase project. Your XP, level, and skill profile have been updated.
+            <br /><strong style={{ color: 'var(--accent-primary)' }}>Auto-advancing to your next skill challenge in a moment…</strong>
+          </p>
+          {completionData?.skills?.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.45rem' }}>
+              <span style={{ fontSize: '0.7rem', fontWeight: 700, color: '#22C55E', alignSelf: 'center' }}>SKILLS UNLOCKED:</span>
+              {[...new Set(completionData.skills)].map(s => (
+                <span key={s} style={{
+                  fontSize: '0.72rem', fontWeight: 600, padding: '0.2rem 0.65rem',
+                  borderRadius: '999px', background: 'rgba(34,197,94,0.12)',
+                  border: '1px solid rgba(34,197,94,0.3)', color: '#22C55E',
+                }}>{s}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {loading && (
+        <div className="result-card" style={{ textAlign: 'center', padding: '4rem 2rem' }}>
+          <Sparkles className="spin" size={36} color="var(--accent-primary)" style={{ margin: '0 auto 1rem' }} />
+          <h3 style={{ marginBottom: '0.5rem' }}>5 Agents Collaborating…</h3>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.88rem', maxWidth: 440, margin: '0 auto' }}>
+            ATLAS is structuring phases · FORGE is crafting unique projects · QUEST is calibrating your daily challenge · SAGE is curating exact resources
+          </p>
+        </div>
+      )}
+
+      {/* ── Phases ── */}
+      {roadmap?.phases && !loading && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+          {roadmap.phases.map((phase, phIdx) => {
+            const isOpen = expandedPhase === phIdx
+            const isCompleted = completedPhases[phIdx] || phase.completed
+            const diffColor = isCompleted ? '#22C55E' : (DIFFICULTY_COLORS[phase.difficulty] || '#00F0FF')
+            const hintLevel = hintLevels[phIdx] || 0
+            const tasksOpen = expandedTasks[phIdx] ?? true
+            const sub = submissions[phIdx] || {}
+            const evalResult = sub.result || (phase.evaluation ? { ...phase.evaluation, _fromCache: true } : null)
+
+            return (
+              <div key={phIdx} className="result-card" style={{
+                borderLeft: `4px solid ${diffColor}`,
+                transition: 'box-shadow 0.2s, border-color 0.3s',
+                boxShadow: isOpen ? `0 0 0 1px ${diffColor}30` : 'none',
+                background: isCompleted ? 'rgba(34,197,94,0.03)' : undefined,
+              }}>
+                {/* Phase header — click to expand/collapse */}
+                <div
+                  onClick={() => setExpandedPhase(isOpen ? -1 : phIdx)}
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', gap: '1rem' }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <span style={{
+                      fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.1em',
+                      color: diffColor, background: `${diffColor}18`, border: `1px solid ${diffColor}40`,
+                      padding: '0.2rem 0.6rem', borderRadius: '999px',
+                    }}>PHASE {phase.phase}</span>
+                    <h3 style={{ margin: 0, fontSize: '1.05rem' }}>{phase.focus_skill}</h3>
+                    {isCompleted ? (
+                      <span style={{
+                        fontSize: '0.67rem', fontWeight: 800, color: '#22C55E',
+                        background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.35)',
+                        padding: '0.15rem 0.6rem', borderRadius: '999px', letterSpacing: '0.06em',
+                      }}>✓ COMPLETED</span>
+                    ) : (
+                      <span style={{
+                        fontSize: '0.65rem', fontWeight: 700, color: diffColor, textTransform: 'uppercase',
+                        background: `${diffColor}12`, padding: '0.15rem 0.5rem', borderRadius: '6px',
+                      }}>{phase.difficulty}</span>
+                    )}
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                      {Math.round(phase.importance * 100)}% demand
+                    </span>
+                    {evalResult && (
+                      <span style={{
+                        fontSize: '0.67rem', fontWeight: 700,
+                        color: evalResult.passed ? '#22C55E' : '#F59E0B',
+                      }}>
+                        {evalResult.passed ? `+${evalResult.xp_awarded} XP` : `Score: ${evalResult.score}/100`}
+                      </span>
+                    )}
+                  </div>
+                  <ChevronRight size={18} color="var(--text-muted)" style={{ transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s', flexShrink: 0 }} />
+                </div>
+
+                {isOpen && (
+                  <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+
+                    {/* ── Learning Tasks ── */}
+                    <div>
+                      <div
+                        onClick={() => setExpandedTasks(p => ({ ...p, [phIdx]: !tasksOpen }))}
+                        style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginBottom: tasksOpen ? '0.75rem' : 0 }}
+                      >
+                        <BookOpen size={15} color="var(--accent-primary)" />
+                        <span style={{ fontSize: '0.82rem', fontWeight: 700, color: 'var(--text-secondary)', letterSpacing: '0.04em' }}>7-DAY LEARNING PLAN</span>
+                        <ChevronRight size={13} color="var(--text-muted)" style={{ transform: tasksOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s' }} />
+                      </div>
+                      {tasksOpen && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                          {(phase.learning_tasks || []).map((task, ti) => (
+                            <div key={ti} style={{
+                              display: 'flex', gap: '0.75rem', alignItems: 'flex-start',
+                              padding: '0.55rem 0.75rem', borderRadius: '8px',
+                              background: 'rgba(255,255,255,0.025)',
+                              border: '1px solid rgba(255,255,255,0.04)',
+                            }}>
+                              <div style={{
+                                minWidth: 22, height: 22, borderRadius: '50%',
+                                background: `${diffColor}20`, border: `1.5px solid ${diffColor}50`,
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                fontSize: '0.65rem', fontWeight: 700, color: diffColor, flexShrink: 0,
+                              }}>
+                                {ti + 1}
+                              </div>
+                              <span style={{ fontSize: '0.88rem', color: 'var(--text-primary)', lineHeight: 1.5 }}>{task}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* ── Portfolio Project (FORGE) ── */}
+                    {phase.project && (
+                      <div style={{
+                        borderRadius: '12px', overflow: 'hidden',
+                        border: '1px solid rgba(139,92,246,0.25)',
+                        background: 'rgba(139,92,246,0.04)',
+                      }}>
+                        <div style={{ padding: '1rem 1.1rem 0.75rem', borderBottom: '1px solid rgba(139,92,246,0.15)' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                            <Trophy size={15} color="#8B5CF6" />
+                            <span style={{ fontSize: '0.65rem', fontWeight: 800, color: '#8B5CF6', letterSpacing: '0.1em' }}>PORTFOLIO PROJECT · FORGE</span>
+                            <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginLeft: 'auto' }}>
+                              ~{phase.project.estimated_hours}h · {phase.project.archetype}
+                            </span>
+                          </div>
+                          <h4 style={{ margin: 0, fontSize: '1rem', color: 'var(--text-primary)' }}>{phase.project.title}</h4>
+                          <p style={{ margin: '0.4rem 0 0', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>{phase.project.description}</p>
+                        </div>
+
+                        <div style={{ padding: '0.85rem 1.1rem', display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+                          {/* Objectives */}
+                          {phase.project.objectives?.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.08em', marginBottom: '0.4rem' }}>OBJECTIVES</div>
+                              <ul style={{ margin: 0, paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                                {phase.project.objectives.map((obj, i) => (
+                                  <li key={i} style={{ fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.5 }}>{obj}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+
+                          {/* Deliverables */}
+                          {phase.project.deliverables?.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.08em', marginBottom: '0.4rem' }}>DELIVERABLES</div>
+                              <ul style={{ margin: 0, paddingLeft: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                                {phase.project.deliverables.map((d, i) => (
+                                  <li key={i} style={{ fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.5 }}>{d}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+
+                          {/* 3-Level Progressive Hint System */}
+                          {phase.project.hints && (
+                            <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: '10px', padding: '0.85rem 1rem' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem' }}>
+                                <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#F59E0B', letterSpacing: '0.08em' }}>💡 HINT SYSTEM</span>
+                                <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>· Reveal progressively — avoid spoiling your own learning</span>
+                              </div>
+                              <div style={{ display: 'flex', gap: '0.5rem', marginBottom: hintLevel > 0 ? '0.75rem' : 0, flexWrap: 'wrap' }}>
+                                {[
+                                  { lv: 1, label: 'Concept', color: '#22C55E' },
+                                  { lv: 2, label: 'Implementation', color: '#F59E0B' },
+                                  { lv: 3, label: 'Architecture', color: '#EF4444' },
+                                  { lv: 4, label: 'Debugging', color: '#8B5CF6' },
+                                ].map(({ lv, label, color }) => (
+                                  <button
+                                    key={lv}
+                                    onClick={() => revealHint(phIdx, hintLevel >= lv ? lv - 1 : lv)}
+                                    style={{
+                                      fontSize: '0.72rem', fontWeight: 700, cursor: 'pointer',
+                                      padding: '0.25rem 0.75rem', borderRadius: '999px',
+                                      border: `1px solid ${hintLevel >= lv ? color : 'rgba(255,255,255,0.12)'}`,
+                                      background: hintLevel >= lv ? `${color}20` : 'transparent',
+                                      color: hintLevel >= lv ? color : 'var(--text-muted)',
+                                      transition: 'all 0.15s',
+                                    }}
+                                  >
+                                    {hintLevel >= lv ? `▼ ${label}` : `▶ ${label}`}
+                                  </button>
+                                ))}
+                              </div>
+                              {hintLevel >= 1 && (
+                                <div style={{ padding: '0.6rem 0.8rem', borderRadius: '8px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', marginBottom: '0.4rem' }}>
+                                  <div style={{ fontSize: '0.65rem', fontWeight: 700, color: '#22C55E', marginBottom: '0.25rem' }}>CONCEPT</div>
+                                  <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.6 }}>{phase.project.hints.level_1}</p>
+                                </div>
+                              )}
+                              {hintLevel >= 2 && (
+                                <div style={{ padding: '0.6rem 0.8rem', borderRadius: '8px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)', marginBottom: '0.4rem' }}>
+                                  <div style={{ fontSize: '0.65rem', fontWeight: 700, color: '#F59E0B', marginBottom: '0.25rem' }}>IMPLEMENTATION</div>
+                                  <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.6 }}>{phase.project.hints.level_2}</p>
+                                </div>
+                              )}
+                              {hintLevel >= 3 && (
+                                <div style={{ padding: '0.6rem 0.8rem', borderRadius: '8px', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', marginBottom: '0.4rem' }}>
+                                  <div style={{ fontSize: '0.65rem', fontWeight: 700, color: '#EF4444', marginBottom: '0.25rem' }}>ARCHITECTURE</div>
+                                  <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.6 }}>{phase.project.hints.level_3}</p>
+                                </div>
+                              )}
+                              {hintLevel >= 4 && phase.project.hints.level_4 && (
+                                <div style={{ padding: '0.6rem 0.8rem', borderRadius: '8px', background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.2)' }}>
+                                  <div style={{ fontSize: '0.65rem', fontWeight: 700, color: '#8B5CF6', marginBottom: '0.25rem' }}>DEBUGGING</div>
+                                  <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-primary)', lineHeight: 1.6 }}>{phase.project.hints.level_4}</p>
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* ── Submit for REVIEW ── */}
+                          <div style={{ borderTop: '1px solid rgba(139,92,246,0.15)', paddingTop: '1rem' }}>
+                            {isCompleted && evalResult ? (
+                              /* Result panel */
+                              <div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                                  <span style={{
+                                    fontSize: '0.68rem', fontWeight: 800, letterSpacing: '0.08em',
+                                    color: evalResult.passed ? '#22C55E' : '#F59E0B',
+                                  }}>
+                                    {evalResult.passed ? '✓ PROJECT PASSED — REVIEW' : '⚠ NEEDS IMPROVEMENT — REVIEW'}
+                                  </span>
+                                </div>
+                                <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.85rem', flexWrap: 'wrap' }}>
+                                  <div style={{ textAlign: 'center', padding: '0.65rem 1.1rem', borderRadius: '10px', background: `${evalResult.passed ? '#22C55E' : '#F59E0B'}15`, border: `1px solid ${evalResult.passed ? '#22C55E' : '#F59E0B'}30` }}>
+                                    <div style={{ fontSize: '1.5rem', fontWeight: 800, color: evalResult.passed ? '#22C55E' : '#F59E0B' }}>{evalResult.score}</div>
+                                    <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 600 }}>Score / 100</div>
+                                  </div>
+                                  {evalResult.xp_awarded > 0 && (
+                                    <div style={{ textAlign: 'center', padding: '0.65rem 1.1rem', borderRadius: '10px', background: 'rgba(0,240,255,0.08)', border: '1px solid rgba(0,240,255,0.2)' }}>
+                                      <div style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--accent-primary)' }}>+{evalResult.xp_awarded}</div>
+                                      <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 600 }}>XP Earned</div>
+                                    </div>
+                                  )}
+                                </div>
+                                {evalResult.feedback && (
+                                  <p style={{ fontSize: '0.83rem', color: 'var(--text-muted)', lineHeight: 1.6, margin: '0 0 0.65rem' }}>{evalResult.feedback}</p>
+                                )}
+                                {evalResult.skill_evidence?.length > 0 && (
+                                  <div style={{ marginBottom: '0.5rem' }}>
+                                    <div style={{ fontSize: '0.67rem', fontWeight: 700, color: '#22C55E', marginBottom: '0.3rem' }}>EVIDENCE FOUND</div>
+                                    <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
+                                      {evalResult.skill_evidence.map((e, i) => <li key={i} style={{ fontSize: '0.78rem', color: 'var(--text-primary)', lineHeight: 1.5 }}>{e}</li>)}
+                                    </ul>
+                                  </div>
+                                )}
+                                {evalResult.missing?.length > 0 && (
+                                  <div style={{ marginBottom: '0.5rem' }}>
+                                    <div style={{ fontSize: '0.67rem', fontWeight: 700, color: '#F59E0B', marginBottom: '0.3rem' }}>TO IMPROVE</div>
+                                    <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
+                                      {evalResult.missing.map((m, i) => <li key={i} style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{m}</li>)}
+                                    </ul>
+                                  </div>
+                                )}
+                                <button
+                                  onClick={() => setSubmissionField(phIdx, { url: '', result: null })}
+                                  style={{ marginTop: '0.6rem', fontSize: '0.75rem', color: 'var(--text-muted)', background: 'transparent', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '6px', padding: '0.3rem 0.75rem', cursor: 'pointer' }}
+                                >
+                                  Resubmit
+                                </button>
+                              </div>
+                            ) : (
+                              /* Input form */
+                              <div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem' }}>
+                                  <Github size={13} color="#8B5CF6" />
+                                  <span style={{ fontSize: '0.68rem', fontWeight: 800, color: '#8B5CF6', letterSpacing: '0.08em' }}>SUBMIT FOR REVIEW</span>
+                                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>— paste your GitHub repo URL</span>
+                                </div>
+                                <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
+                                  <input
+                                    type="url"
+                                    value={sub.url || ''}
+                                    onChange={e => setSubmissionField(phIdx, { url: e.target.value })}
+                                    placeholder="https://github.com/you/your-project"
+                                    disabled={sub.submitting}
+                                    onKeyDown={e => e.key === 'Enter' && handleSubmitProject(phIdx)}
+                                    style={{
+                                      flex: 1, minWidth: 220, padding: '0.55rem 0.85rem',
+                                      borderRadius: '8px', fontSize: '0.85rem',
+                                      background: 'var(--bg-tertiary)', border: '1px solid rgba(139,92,246,0.3)',
+                                      color: 'var(--text-primary)', outline: 'none',
+                                    }}
+                                  />
+                                  <button
+                                    onClick={() => handleSubmitProject(phIdx)}
+                                    disabled={!sub.url?.trim() || sub.submitting}
+                                    style={{
+                                      display: 'flex', alignItems: 'center', gap: '0.4rem',
+                                      padding: '0.55rem 1.1rem', borderRadius: '8px', cursor: 'pointer',
+                                      background: sub.submitting ? 'rgba(139,92,246,0.3)' : 'rgba(139,92,246,0.18)',
+                                      border: '1px solid rgba(139,92,246,0.45)',
+                                      color: '#8B5CF6', fontWeight: 700, fontSize: '0.82rem',
+                                      opacity: !sub.url?.trim() ? 0.5 : 1,
+                                    }}
+                                  >
+                                    {sub.submitting ? <Sparkles className="spin" size={14} /> : <Trophy size={14} />}
+                                    {sub.submitting ? 'Evaluating…' : 'Submit & Evaluate'}
+                                  </button>
+                                </div>
+                                {sub.error && (
+                                  <p style={{ margin: '0.5rem 0 0', fontSize: '0.78rem', color: 'var(--accent-orange)' }}>⚠ {sub.error}</p>
+                                )}
+                                {sub.submitting && (
+                                  <p style={{ margin: '0.5rem 0 0', fontSize: '0.78rem', color: '#8B5CF6' }}>
+                                    REVIEW agent is analysing your repository…
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── Resources (SAGE) ── */}
+                    {phase.resources?.length > 0 && (
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.65rem' }}>
+                          <ExternalLink size={13} color="var(--accent-secondary)" />
+                          <span style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.08em' }}>EXACT LEARNING RESOURCES · SAGE</span>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+                          {phase.resources.map((r, ri) => {
+                            const rColor = RESOURCE_COLORS[r.type] || '#F59E0B'
+                            const rIcon = RESOURCE_ICONS[r.type] || '📝'
+                            return (
+                              <a
+                                key={ri}
+                                href={r.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{
+                                  display: 'flex', gap: '0.75rem', alignItems: 'flex-start',
+                                  padding: '0.75rem 0.9rem', borderRadius: '10px',
+                                  background: `${rColor}0A`, border: `1px solid ${rColor}25`,
+                                  textDecoration: 'none', transition: 'border-color 0.15s',
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.borderColor = `${rColor}55`}
+                                onMouseLeave={e => e.currentTarget.style.borderColor = `${rColor}25`}
+                              >
+                                <span style={{ fontSize: '1rem', flexShrink: 0 }}>{rIcon}</span>
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.15rem', flexWrap: 'wrap' }}>
+                                    <span style={{ fontWeight: 700, fontSize: '0.85rem', color: 'var(--text-primary)' }}>{r.title}</span>
+                                    {r.time_to_consume && (
+                                      <span style={{ fontSize: '0.65rem', color: rColor, background: `${rColor}15`, padding: '0.1rem 0.4rem', borderRadius: '999px', fontWeight: 600 }}>
+                                        {r.time_to_consume}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p style={{ margin: 0, fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>{r.description}</p>
+                                  <div style={{ fontSize: '0.68rem', color: rColor, marginTop: '0.2rem', opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {r.url}
+                                  </div>
+                                </div>
+                                <ExternalLink size={12} color="var(--text-muted)" style={{ flexShrink: 0, marginTop: 2 }} />
+                              </a>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── Empty state ── */}
+      {!roadmap && !loading && (
         <div className="result-card" style={{ textAlign: 'center', padding: '4rem 2rem' }}>
           <div style={{
             width: '80px', height: '80px', background: 'var(--bg-tertiary)',
             borderRadius: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            margin: '0 auto 1.5rem auto'
+            margin: '0 auto 1.5rem',
           }}>
             <Map size={40} color="var(--accent-primary)" />
           </div>
-          <h3 style={{ marginBottom: '0.5rem' }}>Generate Quest Map</h3>
-          <p style={{ color: 'var(--text-muted)', marginBottom: '2rem' }}>
-            Create a personalized plan to conquer your missing skills: {gapResult.missing_skills.slice(0, 3).map(s => s.skill).join(', ')}...
+          <h3 style={{ marginBottom: '0.5rem' }}>Generate Your Personalized Roadmap</h3>
+          <p style={{ color: 'var(--text-muted)', maxWidth: 440, margin: '0 auto 2rem', fontSize: '0.9rem', lineHeight: 1.6 }}>
+            5 AI agents will collaborate to build you a unique, phase-by-phase plan — complete with portfolio projects, progressive hints, daily challenges, and exact resources for:&nbsp;
+            <strong style={{ color: 'var(--text-primary)' }}>
+              {(gapResult.missing_skills || gapResult.ranked_skills || []).slice(0, 3).map(s => s.skill).join(', ')}
+            </strong>
           </p>
-          {error && <p style={{ color: 'var(--accent-orange)', marginBottom: '1rem', fontSize: '0.9rem' }}>⚠ {error}</p>}
-          <button className="analyze-btn" onClick={handleGenerate} disabled={loading} style={{ maxWidth: '300px', margin: '0 auto' }}>
-            {loading ? <Sparkles className="spin" size={20} /> : <Sparkles size={20} />}
-            {loading ? "Generating Map..." : "Generate Quest Map"}
+          <button className="analyze-btn" onClick={handleGenerate} disabled={loading} style={{ maxWidth: 300, margin: '0 auto' }}>
+            <Sparkles size={18} />
+            Generate My Roadmap
           </button>
-        </div>
-      ) : (
-        <div className="results-container">
-          <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
-            <div className="stat-card">
-              <span className="stat-label">Duration</span>
-              <div className="stat-value">
-                {roadmap.total_days != null ? `${roadmap.total_days} Days` : `${roadmap.roadmap?.reduce((s, w) => s + w.days.length, 0) ?? '—'} Days`}
-              </div>
-            </div>
-            <div className="stat-card">
-              <span className="stat-label">Focus Skills</span>
-              <div className="stat-value">{roadmap.total_skills ?? roadmap.roadmap?.length ?? '—'}</div>
-            </div>
-            <div className="stat-card">
-              <span className="stat-label">Alignment</span>
-              <div className="stat-value" style={{ color: roadmap.alignment_score > 70 ? 'var(--accent-secondary)' : 'var(--accent-orange)' }}>
-                {roadmap.alignment_score != null ? `${roadmap.alignment_score}%` : '—'}
-              </div>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.6rem 0.9rem', borderRadius: '8px', background: 'rgba(0,240,255,0.05)', border: '1px solid rgba(0,240,255,0.15)', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            <BookOpen size={14} color="var(--accent-primary)" />
-            Click any topic to get curated YouTube videos, docs, and practice resources
-          </div>
-
-          {roadmap.roadmap.map((week, i) => (
-            <div key={i} className="result-card" style={{ borderLeft: '4px solid var(--accent-primary)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '1rem' }}>
-                <h3>Week {week.week}: {week.focus_skill}</h3>
-                <span className="skill-tag tech">XP: {week.importance * 100}</span>
-              </div>
-              <div className="quest-list">
-                {week.days.map((day, j) => (
-                  <div
-                    key={j}
-                    onClick={() => openDrawer(day, week.focus_skill)}
-                    style={{
-                      display: 'flex', gap: '1rem', padding: '10px 8px',
-                      borderBottom: j < week.days.length - 1 ? '1px solid var(--border-color)' : 'none',
-                      cursor: 'pointer', borderRadius: '8px', transition: 'background 0.15s',
-                    }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,240,255,0.04)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <div style={{
-                      minWidth: '24px', height: '24px', borderRadius: '50%',
-                      border: '2px solid var(--text-muted)', display: 'flex',
-                      alignItems: 'center', justifyContent: 'center', fontSize: '0.7rem',
-                      color: 'var(--text-muted)', flexShrink: 0,
-                    }}>
-                      {day.day}
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{day.task}</div>
-                      <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginTop: '4px' }}>{day.description}</p>
-                    </div>
-                    <BookOpen size={14} style={{ flexShrink: 0, color: 'var(--text-muted)', marginTop: '4px', opacity: 0.5 }} />
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-
-          <div className="result-card" style={{ border: '1px solid var(--accent-orange)', background: 'rgba(245, 158, 11, 0.05)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '1rem' }}>
-              <Trophy size={24} color="var(--accent-orange)" />
-              <h3 style={{ margin: 0, color: 'var(--accent-orange)' }}>Boss Battle: Capstone Project</h3>
-            </div>
-            <div>
-              <h4 style={{ fontSize: '1.1rem', marginBottom: '0.5rem' }}>{roadmap.capstone.task}</h4>
-              <p style={{ color: 'var(--text-muted)' }}>{roadmap.capstone.description}</p>
-            </div>
-          </div>
         </div>
       )}
     </div>
@@ -2245,20 +2452,50 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
     'Machine Learning', 'TypeScript', 'Node.js', 'Git',
   ]
 
+  const TYPE_META = {
+    quiz:            { label: 'Quiz',            icon: '🧠', color: '#8B5CF6' },
+    code_completion: { label: 'Code Completion', icon: '⌨️',  color: '#00F0FF' },
+    debugging:       { label: 'Debug Task',      icon: '🐛', color: '#F59E0B' },
+    micro_impl:      { label: 'Mini Build',      icon: '⚙️',  color: '#22C55E' },
+    concept_explain: { label: 'Explain It',      icon: '💬', color: '#EC4899' },
+  }
+
   const [selectedSkill, setSelectedSkill] = useState(nextPrioritySkill || '')
-  const [challenge, setChallenge] = useState(null)
-  const [submission, setSubmission] = useState('')
-  const [loading, setLoading] = useState(false)
+  const [challenge, setChallenge]         = useState(null)
+  const [submission, setSubmission]       = useState('')
+  const [selectedOption, setSelectedOption] = useState(null)
+  const [unlockedHints, setUnlockedHints] = useState([])
+  const [loading, setLoading]             = useState(false)
   const [fetchingChallenge, setFetchingChallenge] = useState(false)
-  const [error, setError] = useState(null)
-  const [result, setResult] = useState(null)
+  const [error, setError]                 = useState(null)
+  const [result, setResult]               = useState(null)
 
   const handleFetchChallenge = async () => {
     if (!selectedSkill) return
     setFetchingChallenge(true)
     setError(null)
+    setUnlockedHints([])
+    setSelectedOption(null)
+    setSubmission('')
     try {
-      const data = await generateChallenge(selectedSkill)
+      const data = await getDailyChallenge('user_1', selectedSkill)
+      setChallenge(data)
+    } catch (err) {
+      setError(err.message || 'Failed to generate challenge.')
+    } finally {
+      setFetchingChallenge(false)
+    }
+  }
+
+  const handleAutoChallenge = async () => {
+    setFetchingChallenge(true)
+    setError(null)
+    setUnlockedHints([])
+    setSelectedOption(null)
+    setSubmission('')
+    try {
+      const data = await getDailyChallenge('user_1', null, false)
+      setSelectedSkill(data.skill_targeted || '')
       setChallenge(data)
     } catch (err) {
       setError(err.message || 'Failed to generate challenge.')
@@ -2268,19 +2505,12 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
   }
 
   const handleSubmit = async () => {
-    if (!submission) return
+    const answer = challenge?.challenge_type === 'quiz' ? selectedOption : submission
+    if (!answer) return
     setLoading(true)
     setError(null)
     try {
-      const payload = {
-        user_id: 'user_1',
-        submission_text: submission,
-        skill: challenge?.skill || selectedSkill,
-        task_context: challenge?.question || selectedSkill,
-      }
-      if (selectedRole)    payload.target_role  = selectedRole
-      if (allUserSkills?.length) payload.user_skills = allUserSkills
-      const data = await evaluateTask(payload)
+      const data = await evaluateDailyChallenge('user_1', challenge, answer)
       setResult(data)
       if (onComplete) onComplete()
     } catch (err) {
@@ -2294,9 +2524,18 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
     setChallenge(null)
     setResult(null)
     setSubmission('')
+    setSelectedOption(null)
+    setUnlockedHints([])
     setSelectedSkill('')
     setError(null)
   }
+
+  const unlockHint = (idx) => {
+    if (!unlockedHints.includes(idx)) setUnlockedHints(prev => [...prev, idx])
+  }
+
+  const diffColor = { beginner: '#22C55E', intermediate: '#F59E0B', advanced: '#EF4444' }
+  const typeMeta = challenge ? (TYPE_META[challenge.challenge_type] || { label: challenge.challenge_type, icon: '🎯', color: 'var(--accent-primary)' }) : null
 
   return (
     <div className="scan-container">
@@ -2304,9 +2543,9 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
         <div>
           <div className="scan-title">
             <Swords size={32} color="var(--accent-primary)" />
-            <h2>Today's Challenge</h2>
+            <h2>Today's Quest</h2>
           </div>
-          <p className="scan-subtitle">Pick a skill gap, get an AI-generated challenge, earn XP. Do your hardest task first.</p>
+          <p className="scan-subtitle">AI-personalised micro-challenges that sharpen your skills and close gaps. Do your hardest task first.</p>
         </div>
         <div style={{ textAlign: 'right' }}>
           <div style={{ color: 'var(--accent-orange)', fontWeight: 700 }}>+5–20 XP</div>
@@ -2314,42 +2553,62 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
         </div>
       </div>
 
+      {/* ── Result Screen ── */}
       {result ? (
         <div className="results-container fade-in">
           <div className="result-card" style={{ textAlign: 'center', padding: '2rem' }}>
             <div style={{
-              width: '64px', height: '64px', background: 'rgba(34, 197, 94, 0.1)',
+              width: '64px', height: '64px',
+              background: result.passed ? 'rgba(34,197,94,0.1)' : 'rgba(251,146,60,0.1)',
               borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-              margin: '0 auto 1rem auto'
+              margin: '0 auto 1rem auto',
             }}>
-              <Trophy size={32} color="var(--accent-secondary)" />
+              <Trophy size={32} color={result.passed ? 'var(--accent-secondary)' : 'var(--accent-orange)'} />
             </div>
-            <h3 style={{ color: 'var(--accent-secondary)', marginBottom: '1rem' }}>Quest Complete!</h3>
+            <h3 style={{ color: result.passed ? 'var(--accent-secondary)' : 'var(--accent-orange)', marginBottom: '0.4rem' }}>
+              {result.passed ? 'Quest Complete!' : 'Keep Practising!'}
+            </h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+              {result.feedback}
+            </p>
 
-            {result.next_priority_skill && (
+            {/* Mastery delta */}
+            {result.mastery_after !== undefined && (
               <div style={{
-                background: 'rgba(0,240,255,0.06)', border: '1px solid rgba(0,240,255,0.25)',
-                borderRadius: '12px', padding: '0.85rem 1.2rem', marginBottom: '1.25rem',
-                display: 'flex', alignItems: 'center', gap: '0.75rem',
+                display: 'inline-flex', alignItems: 'center', gap: '0.75rem',
+                background: 'rgba(0,240,255,0.06)', border: '1px solid rgba(0,240,255,0.2)',
+                borderRadius: '12px', padding: '0.6rem 1.1rem', marginBottom: '1.25rem',
               }}>
-                <span style={{ fontSize: '1.2rem' }}>🎯</span>
-                <div>
-                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>Next Priority Skill</div>
-                  <div style={{ fontWeight: 700, color: 'var(--accent-primary)', fontSize: '1rem' }}>{result.next_priority_skill}</div>
-                </div>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 600 }}>Mastery</span>
+                <span style={{ fontWeight: 800, color: 'var(--text-primary)' }}>{result.mastery_before}/4</span>
+                <span style={{ color: 'var(--text-muted)' }}>→</span>
+                <span style={{
+                  fontWeight: 800,
+                  color: result.mastery_after > result.mastery_before ? 'var(--accent-secondary)'
+                       : result.mastery_after < result.mastery_before ? 'var(--accent-orange)'
+                       : 'var(--text-primary)',
+                }}>
+                  {result.mastery_after}/4
+                  {result.mastery_after > result.mastery_before ? ' ↑' : result.mastery_after < result.mastery_before ? ' ↓' : ''}
+                </span>
+                {result.gap_updated && (
+                  <span style={{ fontSize: '0.7rem', color: result.score >= 70 ? 'var(--accent-secondary)' : 'var(--accent-orange)', fontWeight: 700 }}>
+                    {result.score >= 70 ? '• Gap shrinking' : '• Gap widening'}
+                  </span>
+                )}
               </div>
             )}
 
             <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem' }}>
               <div className="stat-card">
-                <span className="stat-label">Rating</span>
-                <div className="stat-value" style={{ color: result.feedback?.rating >= 70 ? 'var(--accent-secondary)' : 'var(--accent-orange)' }}>
-                  {result.feedback?.rating}/100
+                <span className="stat-label">Score</span>
+                <div className="stat-value" style={{ color: result.score >= 70 ? 'var(--accent-secondary)' : 'var(--accent-orange)' }}>
+                  {result.score}/100
                 </div>
               </div>
               <div className="stat-card">
                 <span className="stat-label">XP Earned</span>
-                <div className="stat-value" style={{ color: 'var(--accent-primary)' }}>+{result.xp}</div>
+                <div className="stat-value" style={{ color: 'var(--accent-primary)' }}>+{result.xp_earned}</div>
               </div>
               <div className="stat-card">
                 <span className="stat-label">Streak</span>
@@ -2358,87 +2617,110 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
             </div>
           </div>
 
-          {result.feedback && (
-            <>
-              <div className="result-card">
-                <h3 style={{ color: 'var(--accent-orange)' }}>Mistakes & Gaps</h3>
-                <ul style={{ paddingLeft: '1.2rem', color: 'var(--text-muted)', lineHeight: '1.8' }}>
-                  {result.feedback.mistakes.map((m, i) => <li key={i}>{m}</li>)}
-                </ul>
-              </div>
-              <div className="result-card">
-                <h3 style={{ color: 'var(--accent-secondary)' }}>Correct Approach</h3>
-                <p style={{ color: 'var(--text-muted)', lineHeight: '1.7' }}>{result.feedback.correct_approach}</p>
-              </div>
-              <div className="result-card">
-                <h3 style={{ color: 'var(--accent-primary)' }}>How to Improve</h3>
-                <ul style={{ paddingLeft: '1.2rem', color: 'var(--text-muted)', lineHeight: '1.8' }}>
-                  {result.feedback.improvements.map((imp, i) => <li key={i}>{imp}</li>)}
-                </ul>
-              </div>
-            </>
+          {/* Strengths */}
+          {result.strengths?.length > 0 && (
+            <div className="result-card">
+              <h3 style={{ color: 'var(--accent-secondary)', marginBottom: '0.75rem' }}>✅ Strengths</h3>
+              <ul style={{ paddingLeft: '1.2rem', color: 'var(--text-muted)', lineHeight: '1.8', margin: 0 }}>
+                {result.strengths.map((s, i) => <li key={i}>{s}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {/* Mistakes */}
+          {result.mistakes?.length > 0 && (
+            <div className="result-card">
+              <h3 style={{ color: 'var(--accent-orange)', marginBottom: '0.75rem' }}>⚠ Mistakes to Address</h3>
+              <ul style={{ paddingLeft: '1.2rem', color: 'var(--text-muted)', lineHeight: '1.8', margin: 0 }}>
+                {result.mistakes.map((m, i) => <li key={i}>{m}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {/* Ideal answer */}
+          {result.correct_answer && (
+            <div className="result-card">
+              <h3 style={{ color: 'var(--accent-primary)', marginBottom: '0.75rem' }}>💡 Model Answer</h3>
+              <p style={{ color: 'var(--text-muted)', lineHeight: '1.7', margin: 0, whiteSpace: 'pre-wrap' }}>{result.correct_answer}</p>
+            </div>
           )}
 
           <button className="analyze-btn" onClick={handleReset} style={{ marginTop: '1rem' }}>
-            <Swords size={20} />
-            New Quest
+            <Swords size={20} /> New Quest
           </button>
         </div>
+
       ) : !challenge ? (
-        <div className="result-card fade-in" style={{ textAlign: 'center', padding: '3rem 2rem' }}>
+        /* ── Skill Selection Screen ── */
+        <div className="result-card fade-in" style={{ textAlign: 'center', padding: '2.5rem 2rem' }}>
           <div style={{
             width: '80px', height: '80px', background: 'var(--bg-tertiary)',
             borderRadius: '24px', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            margin: '0 auto 1.5rem auto', boxShadow: '0 0 20px rgba(0, 240, 255, 0.1)'
+            margin: '0 auto 1.5rem auto', boxShadow: '0 0 20px rgba(0,240,255,0.1)',
           }}>
             <Swords size={40} color="var(--accent-primary)" />
           </div>
-        <h3 style={{ fontSize: '1.4rem', marginBottom: '0.5rem' }}>Choose Your Challenge</h3>
-          <p style={{ color: 'var(--text-muted)', marginBottom: nextPrioritySkill ? '1rem' : '2rem' }}>
-            Select a skill to receive an AI-generated challenge question
+          <h3 style={{ fontSize: '1.4rem', marginBottom: '0.5rem' }}>Choose Your Challenge</h3>
+          <p style={{ color: 'var(--text-muted)', marginBottom: '1.5rem' }}>
+            Pick a skill or let the AI coach choose for you based on your gaps.
           </p>
 
+          {/* Auto-challenge CTA */}
+          <button
+            className="analyze-btn"
+            onClick={handleAutoChallenge}
+            disabled={fetchingChallenge}
+            style={{
+              maxWidth: '320px',
+              margin: '0 auto 1.5rem auto',
+              background: fetchingChallenge
+                ? 'rgba(0,240,255,0.1)'
+                : 'linear-gradient(135deg, #00f0ff 0%, #8b5cf6 100%)',
+              border: 'none',
+              color: '#000',
+              fontWeight: 700,
+              boxShadow: fetchingChallenge ? 'none' : '0 0 24px rgba(0,240,255,0.45)',
+            }}
+          >
+            {fetchingChallenge ? <Sparkles className="spin" size={20} /> : <Zap size={20} />}
+            {fetchingChallenge ? 'Generating…' : '⚡ AI Pick My Challenge'}
+          </button>
+
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '1rem', textTransform: 'uppercase', letterSpacing: '0.08em' }}>— or choose a skill —</div>
+
+          {/* Recommended skill */}
           {nextPrioritySkill && (
             <div
               onClick={() => setSelectedSkill(nextPrioritySkill)}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: '0.6rem',
                 padding: '0.6rem 1.1rem', borderRadius: '12px', cursor: 'pointer',
-                marginBottom: '1.5rem',
+                marginBottom: '1.25rem',
                 border: `2px solid ${selectedSkill === nextPrioritySkill ? 'var(--accent-primary)' : 'rgba(0,240,255,0.3)'}`,
                 background: selectedSkill === nextPrioritySkill ? 'rgba(0,240,255,0.1)' : 'rgba(0,240,255,0.04)',
-                transition: 'all 0.2s',
               }}
             >
-              <span style={{ fontSize: '1rem' }}>🎯</span>
+              <span>🎯</span>
               <div style={{ textAlign: 'left' }}>
-                <div style={{ fontSize: '0.65rem', color: 'var(--accent-primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>AI Recommended</div>
-                <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--text-primary)' }}>{nextPrioritySkill}</div>
+                <div style={{ fontSize: '0.65rem', color: 'var(--accent-primary)', fontWeight: 700, textTransform: 'uppercase' }}>Priority Gap</div>
+                <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{nextPrioritySkill}</div>
               </div>
-              {selectedSkill === nextPrioritySkill && <span style={{ color: 'var(--accent-primary)', fontWeight: 700, marginLeft: '0.4rem' }}>✓</span>}
+              {selectedSkill === nextPrioritySkill && <span style={{ color: 'var(--accent-primary)', fontWeight: 700 }}>✓</span>}
             </div>
           )}
-          <div className="skills-cloud" style={{ justifyContent: 'center', marginBottom: '2rem' }}>
-            {nextPrioritySkill && (
-              <div style={{ width: '100%', fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center', marginBottom: '0.5rem', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                Or choose another skill:
-              </div>
-            )}
-            {SKILL_OPTIONS.map(skill => (
+
+          <div className="skills-cloud" style={{ justifyContent: 'center', marginBottom: '1.75rem' }}>
+            {SKILL_OPTIONS.map(sk => (
               <span
-                key={skill}
-                className="skill-tag tech"
-                onClick={() => setSelectedSkill(skill)}
+                key={sk} className="skill-tag tech"
+                onClick={() => setSelectedSkill(sk)}
                 style={{
                   cursor: 'pointer',
-                  border: selectedSkill === skill ? '1px solid var(--accent-primary)' : '1px solid transparent',
-                  background: selectedSkill === skill ? 'rgba(0,240,255,0.1)' : undefined,
-                  color: selectedSkill === skill ? 'var(--accent-primary)' : undefined,
-                  transition: 'all 0.2s ease',
+                  border: selectedSkill === sk ? '1px solid var(--accent-primary)' : '1px solid transparent',
+                  background: selectedSkill === sk ? 'rgba(0,240,255,0.1)' : undefined,
+                  color: selectedSkill === sk ? 'var(--accent-primary)' : undefined,
                 }}
-              >
-                {skill}
-              </span>
+              >{sk}</span>
             ))}
           </div>
 
@@ -2451,28 +2733,137 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
             style={{ maxWidth: '300px', margin: '0 auto', opacity: !selectedSkill ? 0.5 : 1 }}
           >
             {fetchingChallenge ? <Sparkles className="spin" size={20} /> : <Zap size={20} />}
-            {fetchingChallenge ? 'Generating Challenge...' : 'Get Challenge'}
+            {fetchingChallenge ? 'Generating Challenge…' : 'Get Challenge'}
           </button>
         </div>
+
       ) : (
+        /* ── Active Challenge Screen ── */
         <div className="result-card fade-in">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem' }}>
-            <span className="skill-tag tech" style={{ border: '1px solid var(--accent-primary)', color: 'var(--accent-primary)' }}>
-              {challenge.skill}
+          {/* Header badges */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
+              padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 700,
+              background: `${typeMeta.color}18`, border: `1px solid ${typeMeta.color}44`, color: typeMeta.color,
+            }}>
+              {typeMeta.icon} {typeMeta.label}
             </span>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>AI-generated challenge</span>
+            <span style={{
+              padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
+              background: `${diffColor[challenge.difficulty_level] || '#888'}18`,
+              border: `1px solid ${diffColor[challenge.difficulty_level] || '#888'}44`,
+              color: diffColor[challenge.difficulty_level] || '#888',
+            }}>
+              {challenge.difficulty_level}
+            </span>
+            <span className="skill-tag tech" style={{ border: '1px solid var(--accent-primary)', color: 'var(--accent-primary)' }}>
+              {challenge.skill_targeted}
+            </span>
+            {challenge.is_gap_skill && (
+              <span style={{
+                padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.7rem', fontWeight: 700,
+                background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444',
+              }}>🔴 Gap Skill</span>
+            )}
+            <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+              +{challenge.xp_available} XP
+            </span>
           </div>
-          <h3 style={{ fontSize: '1.05rem', lineHeight: '1.7', marginBottom: '1.5rem', color: 'var(--text-primary)' }}>
-            {challenge.question}
+
+          {/* Challenge prompt */}
+          <h3 style={{ fontSize: '1rem', lineHeight: '1.7', marginBottom: '1.25rem', color: 'var(--text-primary)', whiteSpace: 'pre-wrap' }}>
+            {challenge.challenge_prompt}
           </h3>
 
-          <textarea
-            className="custom-input"
-            style={{ height: '200px', padding: '1rem', resize: 'none', marginBottom: '1.5rem' }}
-            placeholder="Write your answer here (be technical and specific)..."
-            value={submission}
-            onChange={(e) => setSubmission(e.target.value)}
-          />
+          {/* Context code */}
+          {challenge.context_code && (
+            <pre style={{
+              background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)',
+              borderRadius: '10px', padding: '1rem', overflowX: 'auto',
+              fontSize: '0.82rem', lineHeight: '1.6', color: '#A5F3FC', marginBottom: '1.25rem',
+            }}>{challenge.context_code}</pre>
+          )}
+
+          {/* Quiz options */}
+          {challenge.challenge_type === 'quiz' && challenge.options && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '1.25rem' }}>
+              {Object.entries(challenge.options).map(([key, val]) => (
+                <div
+                  key={key}
+                  onClick={() => setSelectedOption(key)}
+                  style={{
+                    padding: '0.75rem 1rem', borderRadius: '10px', cursor: 'pointer',
+                    border: `1px solid ${selectedOption === key ? 'var(--accent-primary)' : 'var(--border-color)'}`,
+                    background: selectedOption === key ? 'rgba(0,240,255,0.08)' : 'var(--bg-secondary)',
+                    color: selectedOption === key ? 'var(--accent-primary)' : 'var(--text-primary)',
+                    display: 'flex', alignItems: 'center', gap: '0.75rem', transition: 'all 0.15s',
+                  }}
+                >
+                  <span style={{ fontWeight: 800, minWidth: '1.2rem' }}>{key}</span>
+                  <span style={{ fontSize: '0.9rem' }}>{val}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Text answer (non-quiz) */}
+          {challenge.challenge_type !== 'quiz' && (
+            <textarea
+              className="custom-input"
+              style={{ height: '180px', padding: '1rem', resize: 'vertical', marginBottom: '1rem', fontFamily: 'monospace', fontSize: '0.87rem' }}
+              placeholder={
+                challenge.challenge_type === 'debugging' ? 'Describe the bug and paste your fixed code…' :
+                challenge.challenge_type === 'micro_impl' ? 'Write your implementation here…' :
+                challenge.challenge_type === 'code_completion' ? 'Paste the completed code snippet…' :
+                'Explain the concept in your own words…'
+              }
+              value={submission}
+              onChange={e => setSubmission(e.target.value)}
+            />
+          )}
+
+          {/* Expected answer format hint */}
+          {challenge.expected_answer_format && (
+            <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)', marginBottom: '1rem', fontStyle: 'italic' }}>
+              Expected format: {challenge.expected_answer_format}
+            </div>
+          )}
+
+          {/* Hints */}
+          {challenge.hints?.length > 0 && (
+            <div style={{ marginBottom: '1.25rem' }}>
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: '0.5rem' }}>
+                Hints ({unlockedHints.length}/{challenge.hints.length} unlocked)
+              </div>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {challenge.hints.map((hint, idx) => (
+                  <div key={idx} style={{ flex: '1 1 250px' }}>
+                    {unlockedHints.includes(idx) ? (
+                      <div style={{
+                        padding: '0.6rem 0.85rem', borderRadius: '8px', fontSize: '0.82rem',
+                        background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
+                        color: 'var(--text-primary)', lineHeight: '1.5',
+                      }}>
+                        💡 {hint}
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => unlockHint(idx)}
+                        style={{
+                          width: '100%', padding: '0.5rem 0.85rem', borderRadius: '8px', fontSize: '0.78rem',
+                          border: '1px dashed rgba(139,92,246,0.4)', background: 'transparent',
+                          color: '#8B5CF6', cursor: 'pointer', fontWeight: 600,
+                        }}
+                      >
+                        🔒 Unlock Hint {idx + 1}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {error && <p style={{ color: 'var(--accent-orange)', marginBottom: '1rem', fontSize: '0.9rem' }}>⚠ {error}</p>}
 
@@ -2480,20 +2871,20 @@ const DailyQuest = ({ onComplete, selectedRole, allUserSkills, nextPrioritySkill
             <button
               className="analyze-btn"
               onClick={handleSubmit}
-              disabled={loading || submission.length < 20}
+              disabled={loading || (challenge.challenge_type === 'quiz' ? !selectedOption : submission.length < 15)}
               style={{ flex: 1 }}
             >
               {loading ? <Sparkles className="spin" size={20} /> : <Zap size={20} />}
-              {loading ? 'Submitting...' : 'Submit Answer'}
+              {loading ? 'Evaluating…' : 'Submit Answer'}
             </button>
             <button
-              onClick={() => setChallenge(null)}
+              onClick={() => { setChallenge(null); setSubmission(''); setSelectedOption(null); setUnlockedHints([]); }}
               style={{
-                padding: '0 1.5rem', borderRadius: '12px', border: '1px solid var(--border-color)',
-                background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.85rem'
+                padding: '0 1.25rem', borderRadius: '12px', border: '1px solid var(--border-color)',
+                background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.85rem',
               }}
             >
-              Change Skill
+              Change
             </button>
           </div>
         </div>
@@ -2540,7 +2931,7 @@ const Gauge = ({ value, displayValue, label, color, size = 180 }) => {
   )
 }
 
-const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
+const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData, userName }) => {
   if (!metrics) return <div className="loading-state"><Sparkles className="spin" /></div>
 
   const TIERS = [500, 1000, 2500, 5000]
@@ -2549,14 +2940,40 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
   const prevTier = TIERS[TIERS.indexOf(nextTier) - 1] || 0
   const xpProgress = Math.min(((xp - prevTier) / (nextTier - prevTier)) * 100, 100)
 
-  // Build skill proficiency from actual scanned skills if available, else fallback
+  // Build skill proficiency from real data: mastery tracker or skill_distribution from DynamoDB
   const scannedSkills = scanResult?.technical_skills || []
-  const skillProfData = scannedSkills.length > 0
-    ? scannedSkills.slice(0, 8).map((skill, i) => ({
+
+  // Normalise raw skill_xp values to a 0-100 percentage relative to the top skill
+  const normalisedSkillDist = (() => {
+    if (!metrics.skill_distribution || Object.keys(metrics.skill_distribution).length === 0) return {}
+    const entries = Object.entries(metrics.skill_distribution)
+    const maxVal = Math.max(...entries.map(([, v]) => v), 1)
+    return Object.fromEntries(entries.map(([k, v]) => [k, Math.round((v / maxVal) * 100)]))
+  })()
+
+  const skillProfData = (() => {
+    // Prefer normalised skill_distribution from DynamoDB
+    if (Object.keys(normalisedSkillDist).length > 0) {
+      return Object.entries(normalisedSkillDist)
+        .sort(([, a], [, b]) => b - a)
+        .slice(0, 8)
+        .map(([name, value]) => ({ name, value }))
+    }
+    // Fallback: use mastery data if available
+    if (masteryData && Object.keys(masteryData).length > 0) {
+      return Object.entries(masteryData)
+        .slice(0, 8)
+        .map(([name, info]) => ({ name, value: info?.score || 0 }))
+    }
+    // Fallback: use scanned skills with position-based placeholder scores
+    if (scannedSkills.length > 0) {
+      return scannedSkills.slice(0, 8).map((skill, i) => ({
         name: skill,
-        value: Math.max(30, Math.round(80 - i * 7 + Math.random() * 10))
+        value: Math.max(30, Math.round(80 - i * 7))
       }))
-    : Object.entries(metrics.skill_distribution).map(([name, value]) => ({ name, value }))
+    }
+    return []
+  })()
 
   return (
     <div className="scan-container">
@@ -2574,7 +2991,7 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
           <div className="warrior-rank-num">{metrics.level}</div>
         </div>
         <div style={{ flex: 1 }}>
-          <h3 className="warrior-name">Career Warrior</h3>
+          <h3 className="warrior-name">{userName || 'Career Warrior'}</h3>
           <p className="warrior-track">{metrics.rank || 'Unranked'} · {selectedRole || 'Developer'} Track</p>
 
           <div className="level-info" style={{ marginTop: '1.5rem' }}>
@@ -2601,27 +3018,6 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
           </div>
         </div>
       </div>
-
-      {/* ── Learned Skills ── */}
-      {metrics.learned_skills?.length > 0 && (
-        <div className="result-card" style={{ marginBottom: '1.5rem' }}>
-          <h3 style={{ marginBottom: '0.9rem' }}>
-            Learned Skills
-            <span style={{ fontSize: '0.72rem', color: 'var(--accent-secondary)', fontWeight: 400, marginLeft: '0.6rem' }}>practised via Daily Quest</span>
-          </h3>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-            {metrics.learned_skills.map(skill => (
-              <span key={skill} style={{
-                padding: '0.25rem 0.75rem', borderRadius: '999px', fontSize: '0.82rem', fontWeight: 600,
-                background: 'rgba(0,240,255,0.08)', border: '1px solid rgba(0,240,255,0.25)',
-                color: 'var(--accent-primary)',
-              }}>
-                {skill}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* ── Mastery Tracker (from Agentic Intelligence Loop) ── */}
       {masteryData?.mastery_levels?.length > 0 && (
@@ -2670,27 +3066,32 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
       <div className="charts-container" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem', marginBottom: '2rem' }}>
         <div className="result-card" style={{ height: '360px' }}>
           <h3>Knowledge Map</h3>
-          <ResponsiveContainer width="100%" height="85%">
-            <PieChart>
-              <Pie
-                data={metrics.knowledge_map}
-                cx="50%"
-                cy="50%"
-                innerRadius={60}
-                outerRadius={80}
-                paddingAngle={5}
-                dataKey="value"
-              >
-                {metrics.knowledge_map.map((entry, index) => (
-                  <Cell key={`cell-${index}`} fill={entry.color} />
-                ))}
-              </Pie>
-              <Tooltip
-                contentStyle={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px' }}
-              />
-              <Legend verticalAlign="bottom" height={36} />
-            </PieChart>
-          </ResponsiveContainer>
+          {metrics.knowledge_map?.some(e => e.value > 0) ? (
+            <ResponsiveContainer width="100%" height="85%">
+              <PieChart>
+                <Pie
+                  data={metrics.knowledge_map}
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={60}
+                  outerRadius={80}
+                  paddingAngle={5}
+                  dataKey="value"
+                >
+                  {metrics.knowledge_map.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip contentStyle={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px' }} />
+                <Legend verticalAlign="bottom" height={36} />
+              </PieChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{ height: '85%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', gap: '0.5rem' }}>
+              <BarChart2 size={32} strokeWidth={1} />
+              <span style={{ fontSize: '0.85rem' }}>Complete quests to populate your knowledge map</span>
+            </div>
+          )}
         </div>
 
         <div className="result-card" style={{ height: '360px' }}>
@@ -2715,59 +3116,136 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData }) => {
 
         <div className="result-card" style={{ height: '360px' }}>
           <h3>Skill Distribution</h3>
-          <ResponsiveContainer width="100%" height="85%">
-            <RadarChart cx="50%" cy="50%" outerRadius="70%" data={Object.entries(metrics.skill_distribution).map(([name, value]) => ({ subject: name, A: value, fullMark: 100 }))}>
-              <PolarGrid stroke="var(--border-color)" />
-              <PolarAngleAxis dataKey="subject" tick={{ fill: 'var(--text-muted)', fontSize: 12 }} />
-              <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
-              <Radar
-                name="Skills"
-                dataKey="A"
-                stroke="var(--accent-primary)"
-                fill="var(--accent-primary)"
-                fillOpacity={0.3}
-              />
-            </RadarChart>
-          </ResponsiveContainer>
+          {Object.keys(normalisedSkillDist).length > 0 ? (
+            <ResponsiveContainer width="100%" height="85%">
+              <RadarChart cx="50%" cy="50%" outerRadius="70%" data={Object.entries(normalisedSkillDist).map(([name, value]) => ({ subject: name, A: value, fullMark: 100 }))}>
+                <PolarGrid stroke="var(--border-color)" />
+                <PolarAngleAxis dataKey="subject" tick={{ fill: 'var(--text-muted)', fontSize: 12 }} />
+                <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
+                <Radar name="Skills" dataKey="A" stroke="var(--accent-primary)" fill="var(--accent-primary)" fillOpacity={0.3} />
+                <Tooltip contentStyle={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px' }} />
+              </RadarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{ height: '85%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', gap: '0.5rem' }}>
+              <BarChart2 size={32} strokeWidth={1} />
+              <span style={{ fontSize: '0.85rem' }}>Submit quests to build your skill distribution</span>
+            </div>
+          )}
         </div>
 
         <div className="result-card" style={{ height: '360px' }}>
           <h3>Activity Curve</h3>
-          <ResponsiveContainer width="100%" height="85%">
-            <AreaChart
-              data={metrics.activity_log}
-              margin={{ top: 10, right: 10, left: 0, bottom: 0 }}
-            >
-              <defs>
-                <linearGradient id="colorXp" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="var(--accent-secondary)" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="var(--accent-secondary)" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis dataKey="day" stroke="var(--text-muted)" fontSize={12} tickLine={false} axisLine={false} />
-              <YAxis hide />
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--border-color)" />
-              <Tooltip
-                contentStyle={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px' }}
-                itemStyle={{ color: 'var(--accent-secondary)' }}
-              />
-              <Area type="monotone" dataKey="xp" stroke="var(--accent-secondary)" fillOpacity={1} fill="url(#colorXp)" strokeWidth={3} />
-            </AreaChart>
-          </ResponsiveContainer>
+          {metrics.activity_log?.length > 0 ? (
+            <ResponsiveContainer width="100%" height="85%">
+              <AreaChart data={metrics.activity_log} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="colorXp" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="var(--accent-secondary)" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="var(--accent-secondary)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="day" stroke="var(--text-muted)" fontSize={12} tickLine={false} axisLine={false} />
+                <YAxis hide />
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--border-color)" />
+                <Tooltip contentStyle={{ backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: '8px' }} itemStyle={{ color: 'var(--accent-secondary)' }} />
+                <Area type="monotone" dataKey="xp" stroke="var(--accent-secondary)" fillOpacity={1} fill="url(#colorXp)" strokeWidth={3} />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{ height: '85%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', gap: '0.5rem' }}>
+              <Zap size={32} strokeWidth={1} />
+              <span style={{ fontSize: '0.85rem' }}>Your activity history will appear here as you complete quests</span>
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="gauges-wrapper">
-        <Gauge value={(metrics.total_completed_tasks / (metrics.total_assigned_tasks || 1) * 100).toFixed(0)} label="Quest Completion" color="var(--accent-primary)" size={180} />
-        <Gauge value={metrics.execution_score.toFixed(0)} label="Execution Score" color="#8B5CF6" size={180} />
-        <Gauge
-          value={xpProgress}
-          displayValue={500 - (metrics.xp % 500)}
-          label="XP To Next LVL"
-          color="#F59E0B"
-          size={180}
-        />
+      {/* ── Performance Gauges ── */}
+      <div className="result-card" style={{ marginBottom: '1.5rem' }}>
+        <h3 style={{ marginBottom: '1.5rem' }}>Performance Overview</h3>
+        <div className="gauges-wrapper" style={{ background: 'transparent', border: 'none', padding: '0.5rem 0', marginTop: 0, flexWrap: 'wrap', gap: '1.5rem' }}>
+          <Gauge
+            value={Math.round(metrics.total_completed_tasks / (metrics.total_assigned_tasks || 1) * 100)}
+            label="Quest Completion"
+            color="var(--accent-primary)"
+            size={160}
+          />
+          <Gauge
+            value={Math.min(100, Math.round(metrics.execution_score ?? 0))}
+            label="Execution Score"
+            color="#8B5CF6"
+            size={160}
+          />
+          <Gauge
+            value={Math.round(xpProgress)}
+            displayValue={`${nextTier - xp} XP`}
+            label="XP To Next LVL"
+            color="#F59E0B"
+            size={160}
+          />
+          <Gauge
+            value={Math.min(100, Math.round((metrics.streak / 30) * 100))}
+            displayValue={`${metrics.streak}d`}
+            label="Current Streak"
+            color="#10B981"
+            size={160}
+          />
+        </div>
       </div>
+
+      {/* ── Full Stats Breakdown ── */}
+      <div className="result-card" style={{ marginBottom: '1.5rem' }}>
+        <h3 style={{ marginBottom: '1.2rem' }}>Full Player Statistics</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '1rem' }}>
+          {[
+            { icon: '⚡', label: 'Total XP',            value: `${metrics.xp} XP` },
+            { icon: '🏅', label: 'Level',               value: `Level ${metrics.level}` },
+            { icon: '🎖️', label: 'Rank',                value: metrics.rank || 'Unranked' },
+            { icon: '🎯', label: 'Next Priority Skill',  value: metrics.next_priority_skill || '—' },
+            { icon: '✅', label: 'Quests Completed',     value: `${metrics.total_completed_tasks} / ${metrics.total_assigned_tasks}` },
+            { icon: '🔥', label: 'Day Streak',           value: `${metrics.streak} day${metrics.streak !== 1 ? 's' : ''}` },
+            { icon: '📈', label: 'Execution Score',      value: `${(metrics.execution_score ?? 0).toFixed(1)}%` },
+            { icon: '📅', label: 'Last Active',          value: metrics.last_submission_date || '—' },
+            { icon: '🧠', label: 'Skills Learned',       value: `${metrics.learned_skills?.length ?? 0} skills` },
+            { icon: '📊', label: 'Skill Areas Tracked',  value: `${Object.keys(metrics.skill_distribution ?? {}).length} areas` },
+            { icon: '🚀', label: 'XP To Next Level',     value: `${nextTier - xp} XP remaining` },
+            { icon: '🏆', label: 'Level Progress',       value: `${Math.round(xpProgress)}%` },
+          ].map(({ icon, label, value }) => (
+            <div key={label} style={{
+              background: 'var(--bg-primary)',
+              border: '1px solid var(--border-color)',
+              borderRadius: '12px',
+              padding: '1rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.35rem',
+            }}>
+              <span style={{ fontSize: '1.3rem' }}>{icon}</span>
+              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>{label}</span>
+              <span style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--text-primary)' }}>{value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Learned Skills full list ── */}
+      {metrics.learned_skills?.length > 0 && (
+        <div className="result-card" style={{ marginBottom: '1.5rem' }}>
+          <h3 style={{ marginBottom: '0.9rem' }}>All Learned Skills <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 400 }}>({metrics.learned_skills.length})</span></h3>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+            {metrics.learned_skills.map(skill => (
+              <span key={skill} style={{
+                padding: '0.3rem 0.85rem', borderRadius: '999px', fontSize: '0.82rem', fontWeight: 600,
+                background: 'rgba(0,240,255,0.08)', border: '1px solid rgba(0,240,255,0.25)',
+                color: 'var(--accent-primary)',
+              }}>
+                {skill}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
