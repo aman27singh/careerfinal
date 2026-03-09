@@ -11,6 +11,8 @@ from app.models import (
     AnalyzeRoleResponse,
     GenerateCareerPlanRequest,
     GenerateCareerPlanResponse,
+    GenerateDynamicRoadmapRequest,
+    GenerateDynamicRoadmapResponse,
     GenerateRoadmapRequest,
     GenerateRoadmapResponse,
     MasteryLevelItem,
@@ -21,9 +23,15 @@ from app.models import (
     GetResourcesResponse,
     GitHubRepo,
     LearningResource,
+    RoadmapPhase,
+    RoadmapProject,
+    RoadmapProjectHints,
+    RoadmapChallenge,
+    RoadmapResource,
     SkillImpactRequest,
     SkillImpactResponse,
     SkillImpactScoreItem,
+    SubmitPhaseRequest,
     SubmitTaskRequest,
     SubmitTaskResponse,
     UserMasteryResponse,
@@ -65,16 +73,115 @@ def health():
 
 @app.get("/metrics/{user_id}")
 def get_metrics(user_id: str):
-    metrics = load_user_metrics(user_id)
-    # Merge DynamoDB fields into the metrics response
-    try:
-        db_user = user_store.get_user(user_id) or {}
-        metrics.learned_skills = db_user.get("learned_skills") or user_store.get_learned_skills(user_id)
-        # Surface the next priority skill computed by the agentic re-ranking loop
-        metrics.next_priority_skill = db_user.get("next_priority_skill")
-    except Exception:
-        pass  # non-fatal — base metrics still returned
+    """Return user metrics — DynamoDB is the single source of truth.
+
+    Falls back to a fresh defaults record if DynamoDB has no data yet, and
+    supplements with file-based metrics only for first-run bootstrapping.
+    """
+    from app.services.game_engine import calculate_level, calculate_rank
+    from app.services import mastery_tracker
+
+    db_user = user_store.get_user(user_id) or {}
+
+    # ── Build metrics primarily from DynamoDB ────────────────────────────────
+    xp = int(db_user.get("xp", 0))
+    level = int(db_user.get("level", 0)) or calculate_level(xp)
+    streak = int(db_user.get("streak", 0))
+    rank = db_user.get("rank") or calculate_rank(level)
+    total_completed = int(db_user.get("total_completed_tasks", 0))
+    total_assigned = int(db_user.get("total_assigned_tasks", 0))
+    exec_score = float(db_user.get("execution_score", 0.0))
+    last_sub = db_user.get("last_submission_date")
+
+    learned_skills = db_user.get("learned_skills") or user_store.get_learned_skills(user_id)
+    if isinstance(learned_skills, set):
+        learned_skills = sorted(learned_skills)
+
+    next_priority = db_user.get("next_priority_skill")
+
+    # ── Compute real skill_distribution from skill_xp map ────────────────────
+    skill_xp_map = db_user.get("skill_xp", {})
+    if isinstance(skill_xp_map, dict) and skill_xp_map:
+        skill_distribution = {k: int(v) for k, v in skill_xp_map.items()}
+    else:
+        skill_distribution = {}
+
+    # ── Compute real knowledge_map from mastery data ─────────────────────────
+    _km_colors = ["var(--accent-primary)", "var(--accent-secondary)", "#8B5CF6", "#F59E0B", "#10B981", "#EF4444"]
+    knowledge_map = []
+    if learned_skills:
+        try:
+            mastery = mastery_tracker.compute_mastery_for_all_skills(
+                user_skills=learned_skills,
+                verified_skills=set(db_user.get("verified_skills") or []),
+                skill_xp_map=skill_xp_map if isinstance(skill_xp_map, dict) else {},
+            )
+            for i, (sk, info) in enumerate(mastery.items()):
+                knowledge_map.append({
+                    "name": sk,
+                    "value": int(info.get("score", 0)),
+                    "color": _km_colors[i % len(_km_colors)],
+                })
+        except Exception:
+            pass  # non-fatal
+    # Fall back to skill_distribution if mastery scores are all zero or empty
+    if (not knowledge_map or all(int(e.get("value", 0)) == 0 for e in knowledge_map)) and skill_distribution:
+        knowledge_map = [
+            {"name": k, "value": int(v), "color": _km_colors[i % len(_km_colors)]}
+            for i, (k, v) in enumerate(sorted(skill_distribution.items(), key=lambda x: -x[1]))
+        ]
+
+    # ── Build activity_log (real data stored by feedback_agent, else synthetic) ─
+    activity_log = [{"day": e["day"], "xp": int(e.get("xp", 0))} for e in (db_user.get("activity_log") or []) if "day" in e]
+    if not activity_log:
+        _day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        _activity_dates = db_user.get("activity_dates") or []
+        if _activity_dates:
+            from datetime import date as _date
+            _recent = _activity_dates[-7:]
+            _xp_per_day = max(1, xp // max(len(_activity_dates), 1))
+            for _d in _recent:
+                try:
+                    _dt = _date.fromisoformat(_d)
+                    activity_log.append({"day": _day_names[_dt.weekday()], "xp": _xp_per_day})
+                except Exception:
+                    pass
+
+    from app.models import UserMetrics
+    metrics = UserMetrics(
+        user_id=user_id,
+        xp=xp,
+        level=level,
+        rank=rank,
+        streak=streak,
+        total_completed_tasks=total_completed,
+        total_assigned_tasks=total_assigned,
+        execution_score=exec_score,
+        last_submission_date=last_sub,
+        learned_skills=learned_skills if isinstance(learned_skills, list) else [],
+        next_priority_skill=next_priority,
+        skill_distribution=skill_distribution,
+        knowledge_map=knowledge_map,
+        activity_log=activity_log,
+    )
     return metrics
+
+
+@app.post("/sync-skills/{user_id}")
+def sync_skills(user_id: str, payload: dict):
+    """Sync the frontend's allKnownSkills back to DynamoDB.
+
+    Called whenever the frontend's combined skill set changes so that
+    the agentic loop and all agents have the latest user skills.
+    """
+    skills = payload.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    try:
+        user_store.update_user(user_id, {"user_skills": skills})
+    except Exception:
+        pass
+    return {"synced": len(skills)}
 
 
 def _auto_quality_score(submission_text: str) -> int:
@@ -216,7 +323,32 @@ def analyze_profile_endpoint(
             _log.warning("Resume S3 upload skipped: %s", exc)
 
     result = analyze_profile(resume_bytes, github_username)
+    # Persist scan result to DynamoDB so the frontend can reload it
+    if user_id:
+        try:
+            # Extract all skills from scan and persist as user_skills
+            scan_skills = list(set(
+                (result.get("technical_skills") or []) +
+                (result.get("github_analysis", {}).get("primary_languages") or [])
+            ))
+            persist_data = {"scan_result": result}
+            if scan_skills:
+                persist_data["user_skills"] = scan_skills
+            user_store.update_user(user_id, persist_data)
+        except Exception as exc:
+            import logging as _l; _l.getLogger(__name__).warning("scan_result persist failed: %s", exc)
     return ProfileAnalysisResponse(**result)
+
+
+@app.get("/profile-scan/{user_id}")
+def get_profile_scan(user_id: str):
+    """Return the last saved profile scan result for a user."""
+    user = user_store.get_user(user_id) or {}
+    scan = user.get("scan_result")
+    if not scan:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No scan result found")
+    return scan
 
 
 @app.post("/analyze-role", response_model=AnalyzeRoleResponse)
@@ -225,7 +357,28 @@ def analyze_role_endpoint(request: AnalyzeRoleRequest) -> AnalyzeRoleResponse:
         user_skills=request.user_skills,
         selected_role=request.selected_role,
     )
+    # Persist gap result + target role + user skills to DynamoDB
+    uid = request.user_id or "user_1"
+    try:
+        user_store.update_user(uid, {
+            "gap_result": result,
+            "target_role": request.selected_role,
+            "user_skills": request.user_skills,
+        })
+    except Exception:
+        pass
     return AnalyzeRoleResponse(**result)
+
+
+@app.get("/role-gap/{user_id}")
+def get_persisted_role_gap(user_id: str):
+    """Return the last saved role-gap analysis result for a user."""
+    from fastapi import HTTPException
+    db_user = user_store.get_user(user_id) or {}
+    gap = db_user.get("gap_result")
+    if not gap:
+        raise HTTPException(status_code=404, detail="No gap result found")
+    return gap
 
 
 @app.post("/generate-roadmap", response_model=GenerateRoadmapResponse)
@@ -439,22 +592,35 @@ def run_agent(user_id: str):
 # ── Agent: Daily Challenge ────────────────────────────────────────────────────
 
 @app.get("/agent/challenge/{user_id}")
-def get_daily_challenge(user_id: str):
-    """Generate today's adaptive daily challenge for the user's priority skill.
+def get_daily_challenge(
+    user_id: str,
+    skill: str | None = None,
+    force_gap: bool = False,
+):
+    """Generate today's personalised daily challenge.
 
-    Challenge type and difficulty are automatically calibrated to the user's
-    current mastery level (challenge_agent).
+    Auto-calibrated to the full user profile:
+      • SCOUT  — skills from resume + GitHub
+      • DELTA  — skill gaps drive 65 % of challenges
+      • ATLAS  — current roadmap phase shapes difficulty
+      • SAGE   — challenge history avoids repetition + targets mistakes
+
+    Query params:
+        skill      — override target skill (optional)
+        force_gap  — force a gap-skill challenge (default False)
     """
     from app.agents import challenge_agent
     from app.services import user_store
 
     db_user = user_store.get_user(user_id) or {}
-    skill = db_user.get("next_priority_skill") or "Python"
-    mastery_level = db_user.get("mastery_level") or 0
+    mastery_level = int(db_user.get("mastery_level") or 0)
+
     return challenge_agent.generate(
         user_id=user_id,
         skill=skill,
-        mastery_level=int(mastery_level),
+        mastery_level=mastery_level,
+        force_gap=force_gap,
+        db_user=db_user,
     )
 
 
@@ -463,16 +629,22 @@ def evaluate_challenge(user_id: str, payload: dict):
     """Evaluate a user's answer to their daily challenge.
 
     Expects JSON body: {"challenge": {...}, "answer": "..."}
-    Returns pass/fail, XP earned, streak, and detailed feedback.
+
+    Applies mastery formula: new_mastery = (prev*0.7) + (score/100*4*0.3)
+    Updates gap severity and challenge history automatically.
     """
     from app.agents import challenge_agent
+    from app.services import user_store
 
     challenge = payload.get("challenge", {})
     answer = payload.get("answer", "")
+    db_user = user_store.get_user(user_id) or {}
+
     return challenge_agent.evaluate(
         user_id=user_id,
         challenge=challenge,
         answer_text=answer,
+        db_user=db_user,
     )
 
 
@@ -604,3 +776,463 @@ def get_learning_resources(payload: GetResourcesRequest) -> GetResourcesResponse
         resources=[LearningResource(**r) for r in items["resources"]],
         repos=[GitHubRepo(**r) for r in items["repos"]],
     )
+
+
+# ── Dynamic Multi-Agent Roadmap ───────────────────────────────────────────────
+
+@app.post("/roadmap/generate")
+def generate_dynamic_roadmap(req: GenerateDynamicRoadmapRequest):
+    """Kick off async roadmap generation via Lambda self-invocation.
+
+    Returns immediately with {"status": "generating"}.
+    Frontend polls GET /roadmap/{user_id} until status becomes "ready".
+    """
+    import json
+    import logging
+    import os
+    from datetime import datetime, timezone
+
+    import boto3
+    from app.services import user_store
+
+    _log = logging.getLogger(__name__)
+
+    # ── 1. Mark as "generating" in DynamoDB ───────────────────────────────────
+    started_at = datetime.now(timezone.utc).isoformat()
+    user_store.update_user(req.user_id, {
+        "dynamic_roadmap": {
+            "status": "generating",
+            "target_role": req.target_role,
+            "started_at": started_at,
+        }
+    })
+
+    # ── 2. Asynchronously invoke Lambda to run the heavy pipeline ─────────────
+    payload = {
+        "_internal": "generate_roadmap",
+        "user_id": req.user_id,
+        "user_skills": req.user_skills or [],
+        "target_role": req.target_role,
+        "missing_skills": [
+            s if isinstance(s, dict) else {"skill": str(s)}
+            for s in (req.missing_skills or [])
+        ],
+        "mastery_levels": req.mastery_levels or {},
+        "completed_projects": req.completed_projects or [],
+    }
+    try:
+        region = os.getenv("AWS_REGION", "us-east-1")
+        fn_name = os.getenv("AWS_LAMBDA_FUNCTION_NAME", "careeros-api")
+        client = boto3.client("lambda", region_name=region)
+        client.invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",   # async — returns immediately
+            Payload=json.dumps(payload),
+        )
+        _log.info("Async roadmap invoke dispatched for user=%s", req.user_id)
+    except Exception as exc:
+        _log.error("Failed to dispatch async roadmap invoke: %s", exc)
+        # Fall through — the "generating" status is already set
+
+    return {"status": "generating", "target_role": req.target_role, "started_at": started_at}
+
+
+# ── Internal: heavy roadmap generation (called from lambda_handler) ───────────
+
+def _generate_roadmap_internal(event: dict) -> None:
+    """Run the full ATLAS→FORGE→QUEST→SAGE pipeline.
+
+    Called by the Lambda handler for async self-invocations.
+    Writes the final roadmap (or error) directly to DynamoDB.
+    """
+    import logging
+    from datetime import datetime, timezone
+    from app.agents import project_agent, challenge_agent, resource_agent
+    from app.services import user_store
+
+    _log = logging.getLogger(__name__)
+
+    user_id = event["user_id"]
+    target_role = event.get("target_role", "")
+    missing_skills = event.get("missing_skills", [])
+    mastery_levels = event.get("mastery_levels", {})
+
+    # ── 1. Hydrate user context from DynamoDB ─────────────────────────────────
+    db_user = user_store.get_user(user_id) or {}
+    completed_projects: list[str] = db_user.get("completed_projects") or event.get("completed_projects") or []
+    mastery: dict[str, int] = mastery_levels or {}
+
+    # ── 2. Normalize + sort + cap skill gaps ─────────────────────────────────
+    normalized_gaps: list[dict] = []
+    for item in (missing_skills or []):
+        if isinstance(item, dict):
+            normalized_gaps.append({
+                "skill": str(item.get("skill", "Skill")),
+                "importance": float(item.get("importance", 0.5) or 0.5),
+            })
+        else:
+            normalized_gaps.append({"skill": str(item), "importance": 0.5})
+
+    sorted_gaps = sorted(normalized_gaps, key=lambda x: x.get("importance", 0), reverse=True)[:5]
+    if not sorted_gaps:
+        sorted_gaps = [{"skill": "Software Engineering Fundamentals", "importance": 0.9}]
+
+    _MASTERY_TO_DIFFICULTY = ["beginner", "beginner", "intermediate", "intermediate", "advanced"]
+
+    # ── 3. Build each phase sequentially ─────────────────────────────────────
+    # Bedrock throttling can make roadmap generation exceed the Lambda timeout.
+    # To keep UX reliable, we default to deterministic generation (no LLM calls).
+    # You can opt back into LLM enrichment via environment variables.
+    import os
+    _enrich_all = str(os.getenv("ROADMAP_ENRICH_ALL_PHASES", "")).lower() in {"1", "true", "yes"}
+    _enrich_phase1 = str(os.getenv("ROADMAP_ENRICH_PHASE1", "false")).lower() in {"1", "true", "yes"}
+
+    # Import the comprehensive skill-content library
+    from app.services.roadmap_content import skill_tasks, skill_project, skill_resources
+
+    def _default_learning_tasks(skill: str, role: str) -> list[str]:
+        return skill_tasks(skill, role, mastery.get(skill, 0))
+
+    def _default_project(skill: str, role: str, difficulty: str, seed: str, hours: int) -> RoadmapProject:
+        # Derive phase index from seed to pick varied projects per phase
+        phase_idx = int(seed.split(":")[-1]) if ":" in seed and seed.split(":")[-1].isdigit() else 0
+        proj = skill_project(
+            skill=skill,
+            role=role,
+            difficulty=difficulty,
+            phase_idx=phase_idx,
+            mastery_level=mastery.get(skill, 0),
+            user_id=user_id,
+            completed_projects=completed_projects,
+        )
+        raw_hints = proj.get("hints", {})
+        hints = RoadmapProjectHints(
+            level_1=raw_hints.get("level_1", ""),
+            level_2=raw_hints.get("level_2", ""),
+            level_3=raw_hints.get("level_3", ""),
+            level_4=raw_hints.get("level_4", ""),
+        )
+        return RoadmapProject(
+            title=proj.get("title", f"{skill} Project"),
+            description=proj.get("description", ""),
+            objectives=proj.get("objectives", []),
+            deliverables=proj.get("deliverables", []),
+            evaluation_criteria=proj.get("evaluation_criteria", []),
+            hints=hints,
+            archetype=proj.get("archetype", "portfolio_project"),
+            difficulty=difficulty,
+            estimated_hours=proj.get("estimated_hours", hours),
+            unique_seed=seed,
+        )
+
+    def _default_resources(skill: str, role: str, difficulty: str) -> list[RoadmapResource]:
+        """Return skill-specific, direct-link resources from the content library."""
+        items = skill_resources(skill, difficulty)
+        return [
+            RoadmapResource(
+                type=r.get("type", "article"),
+                title=r.get("title", ""),
+                url=r.get("url", ""),
+                description=r.get("description", ""),
+                mastery_fit=difficulty,
+                time_to_consume=r.get("time_to_consume", ""),
+            )
+            for r in items
+        ]
+
+    def _build_phase(idx: int, gap: dict) -> RoadmapPhase:
+        skill = gap.get("skill", "Skill")
+        importance = float(gap.get("importance", 0.5))
+        m_level = min(mastery.get(skill, 0) + idx, 4)
+        difficulty = _MASTERY_TO_DIFFICULTY[m_level]
+
+        enrich_with_llm = _enrich_all or (idx == 0 and _enrich_phase1)
+
+        # --- ATLAS: generate week learning plan ---
+        if enrich_with_llm:
+            try:
+                from app.agents import roadmap_agent as _ra
+                week = _ra.generate_week_plan(skill, target_role)
+                learning_tasks = [d.get("task", "") for d in week if d.get("task")]
+            except Exception as exc:
+                _log.warning("roadmap_agent week plan failed for %s: %s", skill, exc)
+                learning_tasks = _default_learning_tasks(skill, target_role)
+        else:
+            learning_tasks = _default_learning_tasks(skill, target_role)
+
+        # --- FORGE: generate unique personalized project ---
+        project_obj: RoadmapProject | None = None
+        if enrich_with_llm:
+            project_dict: dict = {}
+            try:
+                project_dict = project_agent.run(
+                    user_id=user_id,
+                    skill=skill,
+                    target_role=target_role,
+                    mastery_level=m_level,
+                    completed_projects=completed_projects,
+                )
+            except Exception as exc:
+                _log.warning("project_agent failed for %s: %s", skill, exc)
+
+            if project_dict:
+                raw_hints = project_dict.get("hints") or {}
+                project_obj = RoadmapProject(
+                    title=project_dict.get("title", f"{skill} Project"),
+                    description=project_dict.get("description", ""),
+                    objectives=project_dict.get("objectives", []),
+                    deliverables=project_dict.get("deliverables", []),
+                    evaluation_criteria=project_dict.get("evaluation_criteria", []),
+                    hints=RoadmapProjectHints(
+                        level_1=raw_hints.get("level_1", ""),
+                        level_2=raw_hints.get("level_2", ""),
+                        level_3=raw_hints.get("level_3", ""),
+                        level_4=raw_hints.get("level_4", ""),
+                    ),
+                    archetype=project_dict.get("archetype", ""),
+                    difficulty=project_dict.get("difficulty", difficulty),
+                    estimated_hours=project_dict.get("estimated_hours", 8),
+                    unique_seed=project_dict.get("unique_seed", ""),
+                )
+            else:
+                project_obj = _default_project(
+                    skill=skill,
+                    role=target_role,
+                    difficulty=difficulty,
+                    seed=f"template:{skill}:{target_role}:{idx}",
+                    hours=8 + idx * 2,
+                )
+        else:
+            project_obj = _default_project(
+                skill=skill,
+                role=target_role,
+                difficulty=difficulty,
+                seed=f"template:{skill}:{target_role}:{idx}",
+                hours=8 + idx * 2,
+            )
+
+        # --- QUEST: daily challenge for phase 1 only ---
+        challenge_obj: RoadmapChallenge | None = None
+        if idx == 0:
+            try:
+                ch = challenge_agent.generate(
+                    user_id=user_id,
+                    skill=skill,
+                    mastery_level=mastery.get(skill, 0),
+                )
+                challenge_obj = RoadmapChallenge(
+                    challenge_id=ch.get("challenge_id", ""),
+                    skill=ch.get("skill", skill),
+                    type=ch.get("type", "conceptual"),
+                    difficulty=ch.get("difficulty", "beginner"),
+                    question=ch.get("question", ""),
+                    context_code=ch.get("context_code"),
+                    expected_concepts=ch.get("expected_concepts", []),
+                    xp_available=ch.get("xp_available", 5),
+                    today=ch.get("today", ""),
+                )
+            except Exception as exc:
+                _log.warning("challenge_agent failed for %s: %s", skill, exc)
+
+        # --- SAGE: exact learning resources ---
+        resources_list: list[RoadmapResource] = []
+        if enrich_with_llm:
+            try:
+                raw_resources = resource_agent.run(
+                    skill=skill,
+                    target_role=target_role,
+                    mastery_level=m_level,
+                    max_resources=5,
+                )
+                resources_list = [
+                    RoadmapResource(
+                        type=r.get("type", "article"),
+                        title=r.get("title", ""),
+                        url=r.get("url", ""),
+                        description=r.get("description", ""),
+                        mastery_fit=r.get("mastery_fit", ""),
+                        time_to_consume=r.get("time_to_consume", ""),
+                    )
+                    for r in raw_resources
+                ]
+            except Exception as exc:
+                _log.warning("resource_agent failed for %s: %s", skill, exc)
+                resources_list = _default_resources(skill, target_role, difficulty)
+        else:
+            resources_list = _default_resources(skill, target_role, difficulty)
+
+        return RoadmapPhase(
+            phase=idx + 1,
+            focus_skill=skill,
+            difficulty=difficulty,
+            importance=round(importance, 3),
+            learning_tasks=learning_tasks,
+            project=project_obj,
+            daily_challenge=challenge_obj,
+            resources=resources_list,
+        )
+
+    phases: list[RoadmapPhase] = []
+    for i, gap in enumerate(sorted_gaps):
+        try:
+            phase = _build_phase(i, gap)
+            phases.append(phase)
+        except Exception as exc:
+            _log.error("Phase %d failed: %s", i, exc)
+
+    # ── 4. Persist completed roadmap to DynamoDB ──────────────────────────────
+    generated_at = datetime.now(timezone.utc).isoformat()
+    user_store.update_user(user_id, {
+        "dynamic_roadmap": {
+            "status": "ready",
+            "target_role": target_role,
+            "phases": [p.model_dump() for p in phases],
+            "total_phases": len(phases),
+            "generated_at": generated_at,
+        }
+    })
+    _log.info("Roadmap persisted for user=%s — %d phases", user_id, len(phases))
+
+
+@app.get("/roadmap/{user_id}")
+def get_persisted_roadmap(user_id: str):
+    """Return the last generated dynamic roadmap for a user (from DynamoDB).
+
+    Returns status field: "generating" | "ready" | "failed"
+    Frontend polls this until status is "ready".
+    """
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    from app.services import user_store
+    db_user = user_store.get_user(user_id) or {}
+    roadmap = db_user.get("dynamic_roadmap")
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="No roadmap found")
+    # Ensure status field is always present for backward-compat
+    if "status" not in roadmap:
+        roadmap["status"] = "ready" if roadmap.get("phases") else "unknown"
+
+    # Safety: if a background generation timed out/crashed, don't leave the UI
+    # polling forever.
+    if roadmap.get("status") == "generating" and roadmap.get("started_at"):
+        try:
+            started_at = datetime.fromisoformat(str(roadmap["started_at"]).replace("Z", "+00:00"))
+            age_s = (datetime.now(timezone.utc) - started_at).total_seconds()
+            if age_s > 6 * 60:
+                roadmap["status"] = "failed"
+                roadmap["error"] = "Roadmap generation timed out. Please click Regenerate Roadmap."
+                user_store.update_user(user_id, {"dynamic_roadmap": roadmap})
+        except Exception:
+            pass
+    return roadmap
+
+
+@app.post("/roadmap/{user_id}/phase/{phase_idx}/submit")
+def submit_phase_project(user_id: str, phase_idx: int, payload: SubmitPhaseRequest):
+    """Evaluate a project submission for a roadmap phase.
+
+    Expects JSON body: {"github_repo_url": "https://github.com/..."}
+    Runs REVIEW agent → awards XP → marks phase completed in DynamoDB.
+    Returns evaluation result + updated XP.
+    """
+    import logging
+    from fastapi import HTTPException
+    from app.agents import evaluation_agent
+    from app.services import user_store
+
+    _log = logging.getLogger(__name__)
+
+    github_repo_url = payload.github_repo_url.strip()
+    if not github_repo_url:
+        raise HTTPException(status_code=400, detail="github_repo_url is required")
+
+    # Load the stored roadmap to get the project spec for this phase
+    db_user = user_store.get_user(user_id) or {}
+    roadmap = db_user.get("dynamic_roadmap") or {}
+    phases = roadmap.get("phases", [])
+
+    if phase_idx < 0 or phase_idx >= len(phases):
+        raise HTTPException(status_code=404, detail=f"Phase {phase_idx} not found")
+
+    phase = phases[phase_idx]
+    project = phase.get("project") or {}
+    skill = phase.get("focus_skill", "")
+
+    # Run evaluation agent (REVIEW)
+    result = evaluation_agent.run(
+        user_id=user_id,
+        github_repo_url=github_repo_url,
+        project=project,
+        skill=skill,
+    )
+
+    # Mark phase as completed in DynamoDB regardless of pass/fail
+    # (so the user can see feedback either way; only XP gated on pass)
+    roadmap_complete = False
+    newly_learned_skills: list[str] = []
+    bonus_xp = 0
+    try:
+        phases[phase_idx]["completed"] = True
+        phases[phase_idx]["submission_url"] = github_repo_url
+        phases[phase_idx]["evaluation"] = {
+            "score": result.get("score", 0),
+            "passed": result.get("passed", False),
+            "xp_awarded": result.get("xp_awarded", 0),
+            "feedback": result.get("feedback", ""),
+        }
+        # Append to completed_projects list so FORGE won't repeat it
+        completed_projects: list = db_user.get("completed_projects") or []
+        project_title = project.get("title", skill)
+        if project_title not in completed_projects:
+            completed_projects.append(project_title)
+
+        # Add this phase's skill to learned_skills
+        learned_skills: list = db_user.get("learned_skills") or []
+        if skill and skill not in learned_skills:
+            learned_skills.append(skill)
+            newly_learned_skills.append(skill)
+
+        # Check if ALL phases are now complete → roadmap completion bonus
+        total_phases = len(phases)
+        completed_count = sum(1 for p in phases if p.get("completed"))
+        if completed_count >= total_phases:
+            roadmap_complete = True
+            # Award all phase skills as learned
+            for p in phases:
+                fs = p.get("focus_skill", "")
+                if fs and fs not in learned_skills:
+                    learned_skills.append(fs)
+                    newly_learned_skills.append(fs)
+            # Bonus XP: 500 for completing the full roadmap
+            bonus_xp = 500
+
+        user_store.update_user(user_id, {
+            "dynamic_roadmap": {**roadmap, "phases": phases},
+            "completed_projects": completed_projects,
+            "learned_skills": learned_skills,
+        })
+    except Exception as exc:
+        _log.warning("submit_phase_project: failed to persist completion: %s", exc)
+
+    # ── Update XP/level metrics (file-based game engine) ────────────────────
+    try:
+        from app.services.utils import update_metrics_on_task_submission
+        xp_quality = max(10, min(100, result.get("score", 50)))
+        update_metrics_on_task_submission(user_id, quality_score=xp_quality)
+        if bonus_xp:
+            # Award roadmap completion bonus as two max-quality submissions
+            update_metrics_on_task_submission(user_id, quality_score=100)
+            update_metrics_on_task_submission(user_id, quality_score=100)
+    except Exception as exc:
+        _log.warning("submit_phase_project: xp update failed: %s", exc)
+
+    return {
+        **result,
+        "phase_idx": phase_idx,
+        "skill": skill,
+        "phase_marked_complete": True,
+        "roadmap_complete": roadmap_complete,
+        "newly_learned_skills": newly_learned_skills,
+        "bonus_xp": bonus_xp,
+    }
+

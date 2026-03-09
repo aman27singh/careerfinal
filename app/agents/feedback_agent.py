@@ -106,12 +106,24 @@ def record_activity(
     # ── 5. Compute consistency score ─────────────────────────────────────────
     consistency_score = _compute_consistency(activity_dates)
 
+    # ── 5b. Update activity_log (rolling 30-day XP curve) ────────────────────
+    _day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    activity_log: list[dict] = db_user.get("activity_log") or []
+    if xp_delta > 0:
+        today_day = _day_names[date.today().weekday()]
+        if activity_log and activity_log[-1].get("date") == today:
+            activity_log[-1]["xp"] = int(activity_log[-1].get("xp", 0)) + xp_delta
+        else:
+            activity_log.append({"day": today_day, "date": today, "xp": xp_delta})
+        activity_log = activity_log[-30:]
+
     # ── 6. Persist ────────────────────────────────────────────────────────────
     updates = {
         "xp": new_xp,
         "level": new_level,
         "streak": streak,
         "activity_dates": activity_dates,
+        "activity_log": activity_log,
         "skill_mastery": skill_mastery,
         "consistency_score": consistency_score,
         "last_active": today,
