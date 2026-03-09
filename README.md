@@ -1,6 +1,6 @@
-# 🚀 CareerOS: Agentic AI-Powered Career Co-Pilot
+# 🚀 CareerCoach: Agentic AI-Powered Career Co-Pilot
 
-**CareerOS** is a fully deployed, agentic AI system that autonomously analyzes your skills, tracks mastery, generates personalized learning quests, and recommends high-impact actions based on real market data. The agentic intelligence loop continuously updates your roadmap, mastery tracker, and questing system — ensuring you always receive the most relevant, personalized guidance.
+**CareerCoach** is a fully deployed, agentic AI system that autonomously analyzes your skills, tracks mastery, generates personalized learning quests, and recommends high-impact actions based on real market data. The agentic intelligence loop continuously updates your roadmap, mastery tracker, and questing system — ensuring you always receive the most relevant, personalized guidance.
 
 🌐 **Live App**: [https://ddlbxm6g4ypkb.cloudfront.net](https://ddlbxm6g4ypkb.cloudfront.net)  
 ⚡ **API**: `https://6cnjdgd0yi.execute-api.us-east-1.amazonaws.com`
@@ -19,7 +19,7 @@ Connect your professional identity (Resume + GitHub) to extract a deep-learning 
 Compare your current skill set against real-time market demands. The agentic engine identifies high-priority gaps and suggests specific areas for improvement tailored to your target role.
 
 ### 🗺️ Dynamic Roadmap & Auto-Advancing Quest Map
-CareerOS generates a personalized roadmap with actionable "Agentic Quests." When you complete a roadmap, the system automatically re-analyzes your updated skill set and generates the **next roadmap** — fully hands-free agentic progression.
+CareerCoach generates a personalized roadmap with actionable "Agentic Quests." When you complete a roadmap, the system automatically re-analyzes your updated skill set and generates the **next roadmap** — fully hands-free agentic progression.
 
 ### 🐸 Agentic Daily Quests
 Tackle your most challenging task first with the **Agentic Daily Quest** system. Submit your work and receive AI-powered grading and XP rewards, ensuring continuous progress.
