@@ -61,7 +61,6 @@ AGENT_TOOLS = {
     "compute_skill_impact":  "Score each missing skill by impact: market demand × gap severity × career relevance.",
     "update_mastery":        "Recompute mastery levels across all user skills based on XP, verifications, and GitHub signals.",
     "set_priority_skill":    "Update the user's next recommended skill based on the latest re-ranking.",
-    "generate_roadmap":      "Build a dynamic, prioritized learning roadmap based on current gaps and mastery.",
     # ── Market & skills ──────────────────────────────────────────────────────
     "refresh_market_data":   "Pull fresh job listing data to update what skills are in demand right now.",
     "run_market_intelligence": "Detect emerging skills and compute demand weights for the current skill set.",
@@ -90,21 +89,27 @@ def _observe(user_id: str) -> dict:
         metrics_dict = {}
 
     learned_skills = db_user.get("learned_skills") or []
+    user_skills = db_user.get("user_skills") or []  # from profile scan / role analysis
+    # Merge all skill sources into a single deduplicated list
+    all_skills = list(set(
+        (learned_skills if isinstance(learned_skills, list) else list(learned_skills)) +
+        (user_skills if isinstance(user_skills, list) else list(user_skills))
+    ))
     verified_skills = set(db_user.get("verified_skills") or [])
     target_role = db_user.get("target_role") or metrics_dict.get("target_role", "")
     xp = db_user.get("xp") or metrics_dict.get("xp", 0)
     level = db_user.get("level") or metrics_dict.get("level", 1)
     last_agent_run = db_user.get("last_agent_run")
     last_priority_skill = db_user.get("next_priority_skill")
-    skill_xp_map = db_user.get("skill_xp_map") or {}
+    skill_xp_map = db_user.get("skill_xp", {}) or {}
     quest_history = db_user.get("quest_history") or []
 
     # Compute mastery signals
     mastery_data = {}
-    if learned_skills:
+    if all_skills:
         try:
             mastery_data = mastery_tracker.compute_mastery_for_all_skills(
-                user_skills=learned_skills,
+                user_skills=all_skills,
                 verified_skills=verified_skills,
                 skill_xp_map=skill_xp_map,
             )
@@ -114,7 +119,7 @@ def _observe(user_id: str) -> dict:
     return {
         "user_id": user_id,
         "target_role": target_role,
-        "learned_skills": learned_skills,
+        "learned_skills": all_skills,
         "verified_skills": list(verified_skills),
         "xp": xp,
         "level": level,
@@ -213,7 +218,11 @@ def _plan(reasoning: dict, observation: dict) -> list[dict]:
         })
         add("run_market_intelligence")  # Detect emerging skills
         add("update_mastery")           # Must run before roadmap (needs mastery state)
-        add("generate_roadmap")         # Dynamic: only regens if gaps/mastery changed
+
+        # NOTE: Roadmap generation is handled by the Quest Map async endpoint
+        # (POST /roadmap/generate → DynamoDB.dynamic_roadmap). The agentic loop
+        # must not generate or overwrite that field, otherwise the frontend can
+        # get stuck polling forever.
 
     # ── LLM-decided priority action ─────────────────────────────────────────
     add(reasoning.get("priority_action", "set_priority_skill"))
@@ -221,10 +230,6 @@ def _plan(reasoning: dict, observation: dict) -> list[dict]:
     # ── Optional enrichment actions (LLM-chosen) ────────────────────────────
     for tool in reasoning.get("additional_actions", []):
         add(tool)
-
-    # ── Always generate today's challenge and curate resources ───────────────
-    add("generate_challenge")
-    add("curate_resources")
 
     # ── Always end with priority skill update ────────────────────────────────
     add("set_priority_skill")
@@ -299,8 +304,9 @@ def _act(plan: list[dict], observation: dict, reasoning: dict) -> dict:
                 gaps = results.get("gaps") or []
                 if gaps and target_role:
                     db_user = user_store.get_user(user_id) or {}
-                    # Check if roadmap is stale (mastery changed or gaps changed)
-                    stored_roadmap = db_user.get("roadmap")
+                    # Never overwrite QuestMap roadmap (dynamic_roadmap). If this
+                    # tool is ever invoked, store output separately.
+                    stored_roadmap = db_user.get("simple_roadmap")
                     stored_gap_sig = db_user.get("roadmap_gap_signature", "")
                     current_gap_sig = "|".join(sorted(g.get("skill", "") for g in gaps[:5]))
                     needs_regen = (
@@ -315,7 +321,7 @@ def _act(plan: list[dict], observation: dict, reasoning: dict) -> dict:
                         # Persist roadmap + gap signature so we detect staleness next run
                         try:
                             user_store.update_user(user_id, {
-                                "roadmap": roadmap_result,
+                                "simple_roadmap": roadmap_result,
                                 "roadmap_gap_signature": current_gap_sig,
                             })
                         except Exception:
@@ -462,18 +468,9 @@ def _reflect(observation: dict, reasoning: dict, actions_taken: list[dict], resu
     except Exception as exc:
         logger.debug("_reflect: feedback_agent call failed: %s", exc)
 
-    # Persist last_agent_run timestamp to DynamoDB
+    # Persist last_agent_run timestamp to DynamoDB via user_store (single source of truth)
     try:
-        from boto3 import resource
-        import os
-        table_name = os.getenv("CAREEROS_USERS_TABLE", "careeros-users")
-        region = os.getenv("AWS_REGION", "us-east-1")
-        table = resource("dynamodb", region_name=region).Table(table_name)
-        table.update_item(
-            Key={"user_id": user_id},
-            UpdateExpression="SET last_agent_run = :t",
-            ExpressionAttributeValues={":t": now},
-        )
+        user_store.update_user(user_id, {"last_agent_run": now})
     except Exception:
         pass  # non-fatal
 

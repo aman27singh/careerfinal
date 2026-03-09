@@ -196,6 +196,7 @@ def _serialise_value(val):
     return val
 
 
+def update_xp(user_id: str, amount: int) -> dict:
     """Atomically add *amount* XP to *user_id* and recalculate level.
 
     The user record is created with ``create_user`` first if it does not exist.
@@ -367,7 +368,7 @@ def update_user_profile(user_id: str, target_role: str, user_skills: list[str]) 
     the closed-loop re-ranking always has the latest profile available without
     requiring the frontend to re-send every payload field.
     """
-    table = _table()
+    table = _get_table()
     try:
         table.update_item(
             Key={"user_id": user_id},
@@ -388,7 +389,7 @@ def set_next_priority_skill(user_id: str, skill: str) -> None:
     This is written after every task submission as part of the agentic loop
     so the frontend can immediately surface the most impactful next action.
     """
-    table = _table()
+    table = _get_table()
     try:
         table.update_item(
             Key={"user_id": user_id},
@@ -410,7 +411,7 @@ def add_learned_skill(user_id: str, skill: str) -> None:
     if get_user(user_id) is None:
         create_user(user_id)
     try:
-        _table().update_item(
+        _get_table().update_item(
             Key={"user_id": user_id},
             UpdateExpression="ADD learned_skills :s",
             ExpressionAttributeValues={":s": {skill}},

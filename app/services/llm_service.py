@@ -32,9 +32,10 @@ logger = logging.getLogger(__name__)
 _MODEL_ID = "amazon.nova-pro-v1:0"
 _REGION: str = os.getenv("AWS_REGION", "us-east-1")
 
-# Retry configuration
-_MAX_RETRIES: int = 3
-_RETRY_BASE_DELAY: float = 1.0   # seconds; doubles each attempt
+# Retry configuration — longer waits to recover from Bedrock throttling.
+# With 4 retries starting at 3s: waits are 3s, 6s, 12s, 24s (+jitter).
+_MAX_RETRIES: int = 4
+_RETRY_BASE_DELAY: float = 3.0   # seconds; doubles each attempt + jitter
 
 # Bedrock error codes that are safe to retry
 _RETRYABLE_CODES: frozenset[str] = frozenset(
@@ -99,7 +100,9 @@ def ask_llm(prompt: str) -> str:
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
             if error_code in _RETRYABLE_CODES and attempt <= _MAX_RETRIES:
-                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                import random
+                base = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                delay = base + random.uniform(0, base * 0.3)  # up to 30% jitter
                 logger.warning(
                     "Bedrock transient error '%s' on attempt %d — retrying in %.1fs…",
                     error_code,

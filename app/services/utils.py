@@ -100,4 +100,22 @@ def update_metrics_on_task_submission(
         completed_increment=completed_increment,
     )
     save_user_metrics(user_id, metrics)
+
+    # ── Sync to DynamoDB for durability across Lambda cold starts ─────────
+    try:
+        from app.services import user_store
+        user_store.update_user(user_id, {
+            "xp": metrics.xp,
+            "level": metrics.level,
+            "streak": metrics.streak,
+            "rank": metrics.rank,
+            "total_completed_tasks": metrics.total_completed_tasks,
+            "total_assigned_tasks": metrics.total_assigned_tasks,
+            "execution_score": float(metrics.execution_score),
+            "last_submission_date": metrics.last_submission_date,
+        })
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("DynamoDB metrics sync failed (non-fatal)")
+
     return metrics

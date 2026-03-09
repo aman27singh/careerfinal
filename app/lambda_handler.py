@@ -40,10 +40,35 @@ _mangum = Mangum(app, lifespan="off")
 def handler(event, context):
     """Entry point.
 
-    Handles two event types:
-    1. EventBridge scheduled events  →  run market refresh directly
-    2. Everything else (API Gateway) →  delegate to Mangum / FastAPI
+    Handles three event types:
+    1. Internal async roadmap generation  →  run roadmap pipeline directly
+    2. EventBridge scheduled events        →  run market refresh directly
+    3. Everything else (API Gateway)       →  delegate to Mangum / FastAPI
     """
+    # ── Internal async roadmap generation ─────────────────────────────────────
+    if event.get("_internal") == "generate_roadmap":
+        _log.info("Internal async roadmap generation for user=%s role=%s",
+                   event.get("user_id"), event.get("target_role"))
+        try:
+            from app.main import _generate_roadmap_internal
+            _generate_roadmap_internal(event)
+            _log.info("Async roadmap generation completed for user=%s", event.get("user_id"))
+        except Exception as exc:
+            _log.error("Async roadmap generation failed: %s", exc)
+            # Mark as failed in DynamoDB so frontend stops polling
+            try:
+                from app.services import user_store
+                user_store.update_user(event["user_id"], {
+                    "dynamic_roadmap": {
+                        "status": "failed",
+                        "error": str(exc)[:200],
+                        "target_role": event.get("target_role", ""),
+                    }
+                })
+            except Exception:
+                pass
+        return {"statusCode": 200, "body": "roadmap generation handled"}
+
     # EventBridge scheduled rule: {"source": "aws.events", "detail-type": "Scheduled Event"}
     if event.get("source") == "aws.events":
         _log.info("EventBridge scheduled trigger — running weekly market refresh")

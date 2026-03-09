@@ -12,26 +12,10 @@ class UserMetrics(BaseModel):
     execution_score: float
     last_submission_date: str | None = None
     learned_skills: list[str] = []  # skills practised via Daily Quest (persisted in DynamoDB)
-    skill_distribution: dict[str, int] = {
-        "Technical": 65,
-        "System Design": 40,
-        "Execution": 78,
-        "Soft Skills": 50,
-        "Strategic": 30
-    }
-    activity_log: list[dict[str, int | str]] = [
-        {"day": "Mon", "xp": 45},
-        {"day": "Tue", "xp": 52},
-        {"day": "Wed", "xp": 38},
-        {"day": "Thu", "xp": 65},
-        {"day": "Fri", "xp": 48}
-    ]
-    knowledge_map: list[dict[str, int | str]] = [
-        {"name": "Backend", "value": 40, "color": "var(--accent-primary)"},
-        {"name": "Frontend", "value": 25, "color": "var(--accent-secondary)"},
-        {"name": "DevOps", "value": 20, "color": "#8B5CF6"},
-        {"name": "AI/ML", "value": 15, "color": "#F59E0B"}
-    ]
+    next_priority_skill: str | None = None  # computed by agentic loop re-ranking
+    skill_distribution: dict[str, int] = {}
+    activity_log: list[dict[str, int | str]] = []
+    knowledge_map: list[dict[str, int | str]] = []
 
 
 class RoleGap(BaseModel):
@@ -153,6 +137,7 @@ class MissingSkill(BaseModel):
 class AnalyzeRoleRequest(BaseModel):
     user_skills: list[str]
     selected_role: str
+    user_id: str | None = None  # when provided, gap result is persisted to DynamoDB
 
 
 class AnalyzeRoleResponse(BaseModel):
@@ -281,3 +266,79 @@ class SkillImpactResponse(BaseModel):
     ranked_skills: list[SkillImpactScoreItem]
     top_priority: str | None      # single highest-impact skill to learn next
     alignment_score: float        # % of top-10 role skills already covered
+
+
+# ── Dynamic Multi-Agent Roadmap ───────────────────────────────────────────────
+
+class RoadmapProjectHints(BaseModel):
+    level_1: str = ""    # Concept hint — what problem domain to think about
+    level_2: str = ""    # Implementation hint — how to approach the solution
+    level_3: str = ""    # Architecture hint — how to structure the code/system
+    level_4: str = ""    # Debugging hint — common pitfalls and how to fix them
+
+
+class RoadmapProject(BaseModel):
+    title: str
+    description: str
+    objectives: list[str]
+    deliverables: list[str]
+    evaluation_criteria: list[str]
+    hints: RoadmapProjectHints
+    archetype: str
+    difficulty: str
+    estimated_hours: int
+    unique_seed: str = ""
+
+
+class RoadmapChallenge(BaseModel):
+    challenge_id: str
+    skill: str
+    type: str
+    difficulty: str
+    question: str
+    context_code: str | None = None
+    expected_concepts: list[str] = []
+    xp_available: int
+    today: str
+
+
+class RoadmapResource(BaseModel):
+    type: str
+    title: str
+    url: str
+    description: str
+    mastery_fit: str = ""
+    time_to_consume: str = ""
+
+
+class RoadmapPhase(BaseModel):
+    phase: int
+    focus_skill: str
+    difficulty: str
+    importance: float
+    learning_tasks: list[str]
+    project: RoadmapProject | None = None
+    daily_challenge: RoadmapChallenge | None = None
+    resources: list[RoadmapResource] = []
+
+
+class SubmitPhaseRequest(BaseModel):
+    github_repo_url: str
+
+
+class GenerateDynamicRoadmapRequest(BaseModel):
+    user_id: str
+    user_skills: list[str]
+    target_role: str
+    missing_skills: list[dict]          # [{skill, importance}, ...]
+    mastery_levels: dict[str, int] = {} # {skill: 0-4}
+    github_username: str = ""
+    completed_projects: list[str] = []
+
+
+class GenerateDynamicRoadmapResponse(BaseModel):
+    target_role: str
+    phases: list[RoadmapPhase]
+    total_phases: int
+    generated_at: str
+    agent_summary: str = ""

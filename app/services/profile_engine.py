@@ -59,7 +59,7 @@ def _infer_experience_level(text: str) -> str:
 
 # ── LLM extraction ───────────────────────────────────────────────────────────
 _LLM_PROMPT_TMPL = """
-You are a senior technical recruiter and career coach.
+You are a senior technical recruiter and career coach with 15+ years of experience.
 Analyze the resume text below and return a single JSON object with EXACTLY this schema — no markdown, no explanation, only JSON:
 
 {{
@@ -69,7 +69,8 @@ Analyze the resume text below and return a single JSON object with EXACTLY this 
   "technical_skills": ["skill1", "skill2", ...],
   "soft_skills": ["skill1", "skill2", ...],
   "skill_ratings": [
-    {{"skill": "Python", "score": 85, "level": "Advanced", "evidence": "5 years, used in 3 ML projects"}},
+    {{"skill": "Python", "score": 72, "level": "Advanced", "evidence": "Used in 3 ML projects with FastAPI and pandas, but no published packages"}},
+    {{"skill": "React", "score": 58, "level": "Intermediate", "evidence": "Built one frontend project; no Next.js or testing mentioned"}},
     ...
   ],
   "projects": [
@@ -88,12 +89,18 @@ Analyze the resume text below and return a single JSON object with EXACTLY this 
   "improvement_areas": ["area1", "area2"]
 }}
 
-Rules:
-- skill_ratings must cover ALL technical_skills mentioned, each with score 0-100
-- Score meaning: 0-30=Beginner, 31-60=Intermediate, 61-85=Advanced, 86-100=Expert
-- projects: extract EVERY distinct project, personal project, capstone, open-source contribution
-- evidence: cite specific resume lines as brief justification for the rating
-- improvement_areas: infer gaps from the experience level and skill set
+CRITICAL scoring rules — read carefully:
+- Each skill MUST have a UNIQUE score — never repeat the same number twice
+- Scores must reflect actual depth of evidence in the resume, not just the label
+- Base score on: years used, project complexity, breadth of use, certifications, depth of evidence
+- Level thresholds (use as a GUIDE only, not as a target ceiling):
+    Beginner: 10-35  (mentioned once, no project evidence)
+    Intermediate: 36-65  (used in projects but limited depth)
+    Advanced: 66-84  (heavy use across multiple complex projects)
+    Expert: 85-100  (production systems, open source, teaching, certifications)
+- DO NOT round to 60, 70, 80, 85 — use precise values like 47, 63, 71, 78, 82
+- evidence: write 1 sentence citing SPECIFIC resume content (project name, role, metric)
+- If evidence is thin, score LOW — do not inflate
 - Return ONLY the JSON object, nothing else
 
 RESUME:
@@ -108,7 +115,7 @@ def _llm_analyze_resume(resume_text: str) -> dict | None:
         client = boto3.client("bedrock-runtime", region_name=_REGION)
         body = {
             "messages": [{"role": "user", "content": [{"text": prompt}]}],
-            "inferenceConfig": {"maxTokens": 3000, "temperature": 0.1},
+            "inferenceConfig": {"maxTokens": 4000, "temperature": 0.4},
         }
         resp = client.invoke_model(
             modelId=_BEDROCK_MODEL,

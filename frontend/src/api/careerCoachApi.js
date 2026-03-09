@@ -84,6 +84,40 @@ export async function evaluateTask(data) {
 }
 
 /**
+ * Generate a personalised daily challenge via the new QUEST agent.
+ * Automatically targets gap skills (65%) and known skills (35%).
+ *
+ * @param {string} userId
+ * @param {string|null} skill   Override target skill (optional)
+ * @param {boolean} forceGap   Force a gap-skill challenge
+ */
+export async function getDailyChallenge(userId, skill = null, forceGap = false) {
+  const params = new URLSearchParams()
+  if (skill) params.set('skill', skill)
+  if (forceGap) params.set('force_gap', 'true')
+  const qs = params.toString() ? `?${params}` : ''
+  const res = await fetch(`${BASE_URL}/agent/challenge/${userId}${qs}`)
+  return _handleResponse(res)
+}
+
+/**
+ * Evaluate a user's daily challenge answer.
+ * Applies mastery formula: new_mastery = prev*0.7 + score/100*4*0.3
+ *
+ * @param {string} userId
+ * @param {object} challenge  Challenge object returned by getDailyChallenge
+ * @param {string} answer     User's text answer
+ */
+export async function evaluateDailyChallenge(userId, challenge, answer) {
+  const res = await fetch(`${BASE_URL}/agent/challenge/${userId}/evaluate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ challenge, answer }),
+  })
+  return _handleResponse(res)
+}
+
+/**
  * Generate an AI challenge question for a given skill.
  *
  * @param {string} skill  The skill to generate a challenge for.
@@ -163,6 +197,89 @@ export async function runAgentLoop(userId) {
   const res = await fetch(`${BASE_URL}/agent/run/${userId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+  })
+  return _handleResponse(res)
+}
+
+/**
+ * Fetch the last saved profile scan result for a user from DynamoDB.
+ * @param {string} userId
+ * @returns {Promise<ProfileAnalysisResponse|null>}
+ */
+export async function getProfileScan(userId) {
+  const res = await fetch(`${BASE_URL}/profile-scan/${userId}`)
+  if (res.status === 404) return null
+  return _handleResponse(res)
+}
+
+/**
+ * Fetch the last saved role-gap analysis result for a user from DynamoDB.
+ * @param {string} userId
+ * @returns {Promise<AnalyzeRoleResponse|null>}
+ */
+export async function getPersistedRoleGap(userId) {
+  const res = await fetch(`${BASE_URL}/role-gap/${userId}`)
+  if (res.status === 404) return null
+  return _handleResponse(res)
+}
+
+/**
+ * Kick off async roadmap generation.
+ * Returns immediately with {"status": "generating"}.
+ * Frontend should poll getPersistedRoadmap() until status is "ready".
+ *
+ * @param {{ user_id, user_skills, target_role, missing_skills, mastery_levels, github_username, completed_projects }} data
+ * @returns {Promise<{status: string, target_role: string}>}
+ */
+export async function generateDynamicRoadmap(data) {
+  const res = await fetch(`${BASE_URL}/roadmap/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  return _handleResponse(res)
+}
+
+/**
+ * Fetch the last persisted dynamic roadmap for a user from DynamoDB.
+ * @param {string} userId
+ * @returns {Promise<GenerateDynamicRoadmapResponse|null>}
+ */
+export async function getPersistedRoadmap(userId) {
+  const res = await fetch(`${BASE_URL}/roadmap/${userId}`)
+  if (res.status === 404) return null
+  return _handleResponse(res)
+}
+
+/**
+ * Submit a project GitHub URL for REVIEW agent evaluation.
+ * Awards XP and marks the phase complete in DynamoDB.
+ *
+ * @param {string} userId
+ * @param {number} phaseIdx  0-based phase index
+ * @param {string} githubRepoUrl
+ * @returns {Promise<EvaluationResult>}
+ */
+export async function submitPhaseProject(userId, phaseIdx, githubRepoUrl) {
+  const res = await fetch(`${BASE_URL}/roadmap/${userId}/phase/${phaseIdx}/submit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ github_repo_url: githubRepoUrl }),
+  })
+  return _handleResponse(res)
+}
+
+/**
+ * Sync the frontend's computed allKnownSkills to DynamoDB so the
+ * agentic loop and all agents always have the latest skill set.
+ * @param {string} userId
+ * @param {string[]} skills
+ */
+export async function syncSkills(userId, skills) {
+  const res = await fetch(`${BASE_URL}/sync-skills/${userId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ skills }),
   })
   return _handleResponse(res)
 }
