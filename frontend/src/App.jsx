@@ -630,6 +630,45 @@ const MASTERY_COLORS = {
   4: '#F59E0B',
 }
 
+const RANK_META = {
+  bronze:   { emoji: '🥉', img: 'https://em-content.zobj.net/source/apple/391/3rd-place-medal_1f949.png', color: '#CD7F32', glow: 'rgba(205,127,50,0.55)' },
+  silver:   { img: 'https://em-content.zobj.net/source/apple/391/2nd-place-medal_1f948.png', color: '#C0C0C0', glow: 'rgba(192,192,192,0.45)' },
+  gold:     { img: 'https://em-content.zobj.net/source/apple/391/1st-place-medal_1f947.png', color: '#FFD700', glow: 'rgba(255,215,0,0.55)' },
+  platinum: { emoji: '💠', color: '#E5E4E2', glow: 'rgba(229,228,226,0.4)' },
+  diamond:  { emoji: '💎', color: '#00F0FF', glow: 'rgba(0,240,255,0.55)' },
+}
+
+const RankBadge = ({ rank, size = 48 }) => {
+  const key = (rank || '').toLowerCase()
+  const meta = RANK_META[key]
+  const inner = meta?.img ? (
+    <img
+      src={meta.img}
+      alt={rank}
+      width={size}
+      height={size}
+      style={{ objectFit: 'contain', display: 'block', filter: `drop-shadow(0 0 6px ${meta?.color || '#aaa'})` }}
+      onError={e => { e.target.style.display='none'; e.target.nextSibling.style.display='block' }}
+    />
+  ) : (
+    <span style={{ fontSize: size * 0.9, lineHeight: 1, filter: meta ? `drop-shadow(0 0 6px ${meta.color})` : 'none' }}>
+      {meta?.emoji || '🎖️'}
+    </span>
+  )
+  return (
+    <div style={{
+      width: size + 20, height: size + 20,
+      borderRadius: '50%',
+      background: meta ? `radial-gradient(circle, ${meta.glow} 0%, transparent 72%)` : 'transparent',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      flexShrink: 0,
+    }}>
+      {inner}
+      {meta?.img && <span style={{ display: 'none', fontSize: size * 0.9, lineHeight: 1 }}>{meta?.emoji || '🎖️'}</span>}
+    </div>
+  )
+}
+
 const CareerIntelligence = ({ metrics, masteryData, marketStats, setActiveTab }) => {
   const nextSkill = metrics?.next_priority_skill
   const totalJobs = marketStats?.total_jobs_processed
@@ -1126,10 +1165,8 @@ const WelcomeSection = ({ metrics, userName, onSetName }) => {
     <section className="welcome-card">
       <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
         <div className="welcome-badge">
-          <div className="star-icon">
-            <Award size={32} color="var(--text-muted)" />
-          </div>
-          <span style={{ fontSize: '0.7rem', marginTop: '0.5rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+          <RankBadge rank={metrics?.rank} size={36} />
+          <span style={{ fontSize: '0.7rem', marginTop: '0.25rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, letterSpacing: '0.05em' }}>
             {metrics?.rank || 'unranked'}
           </span>
         </div>
@@ -2987,7 +3024,7 @@ const PlayerStats = ({ metrics, selectedRole, scanResult, masteryData, userName 
 
       <div className="result-card career-warrior-card">
         <div className="warrior-badge">
-          <Award size={48} color="var(--text-muted)" />
+          <RankBadge rank={metrics.rank} size={44} />
           <div className="warrior-rank-num">{metrics.level}</div>
         </div>
         <div style={{ flex: 1 }}>
