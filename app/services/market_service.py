@@ -303,7 +303,7 @@ _JSEARCH_QUERIES: list[tuple[str, str]] = [
 ]
 
 
-def _fetch_jsearch_role(query: str, num_pages: int = 3) -> list[dict]:
+def _fetch_jsearch_role(query: str, num_pages: int = 2) -> list[dict]:
     """Fetch jobs from JSearch (RapidAPI) — aggregates Indeed, LinkedIn, Glassdoor."""
     key = _get_rapidapi_key()
     if not key:
@@ -319,7 +319,7 @@ def _fetch_jsearch_role(query: str, num_pages: int = 3) -> list[dict]:
         "date_posted": "month",
     }
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp = requests.get(url, headers=headers, params=params, timeout=int(os.getenv("JSEARCH_TIMEOUT", "25")))
         if resp.status_code == 429:
             logger.warning("JSearch rate limit hit (429) for '%s'", query)
             return []
